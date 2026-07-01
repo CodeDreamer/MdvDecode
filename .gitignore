@@ -1,0 +1,67 @@
+# Build output
+x64/
+Win32/
+Debug/
+Release/
+[Dd]ebug/
+[Rr]elease/
+ipch/
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+
+# Visual Studio user/session files
+.vs/
+*.suo
+*.user
+*.ncb
+*.aps
+*.sdf
+*.opensdf
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# Sample logic traces and generated images (kept out of the repo — too large)
+*.sr
+*.MDVRAW
+*.mdvraw
+*.MDRAW
+
+# ...but keep one compressed sample trace for smoke-testing
+!captures/68KOSUtil.sr
+
+# Sample capture directories (each contains logic-1-N binary chunks)
+ASM1/
+ASM2/
+GstUtil/
+dragonhold_backup/
+icl_basic/
+icl_demo/
+tapezx/
+zkul/
+
+# Diagnostic / debug artifacts
+out/
+*.jpg
+*.png
+*.bmp
+*.pdf
+*.csv
+export.bin
+
+# ...but keep the documentation photos
+!MdvConnector.jpg
+!blocks.jpg
+
+# Local session helpers
+*.cmd
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
