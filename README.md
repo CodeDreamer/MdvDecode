@@ -153,6 +153,10 @@ Example of debug picture generated with the -jpg option:
 
 ![Trace Blocks Layout](blocks.jpg)
 
+Legend for -jpg option:
+
+![Blocks Jpg Legend](block_legend.png)
+
 ## Output
 
 The `.MDVRAW` file format is documented in [MDVRAW_FORMAT.md](MDVRAW_FORMAT.md).

@@ -191,11 +191,12 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
     int dbgIndex = 0;
     int lastWrapTime = INT_MIN;
     int numWraps = 0;
+    bool firstIter = true;
     for (const Block& b: blocks)
     {
         if (b.order < lastOrder)
         {
-            bool tooSoon = (lastWrapTime != INT_MIN &&
+            bool tooSoon = (!firstIter && lastWrapTime != INT_MIN &&
                              (int64_t)(b.startTime - lastWrapTime) < minWrapSpacing);
             if (tooSoon)
             {
@@ -210,14 +211,35 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
             }
             else
             {
-                numWraps++;
-                if (verbose)
+                // If the row we're leaving had no hasNext blocks (nothing
+                // contributed a distance for its transition), fall back to
+                // the raw wrap-to-wrap time delta so the distance array
+                // stays aligned with the wrap count. Without this, pass 2
+                // would apply the NEXT row's distance at the wrong wrap
+                // and render subsequent rows off-screen. Reference for the
+                // delta is the last real wrap, or the very first block if
+                // this is the first real wrap.
+                if (!firstIter && !hasDistance)
                 {
-                    int deltaFromLastWrap = (lastWrapTime == INT_MIN) ? 0 : b.startTime - lastWrapTime;
-                    printf("wrap at dbgId=%d (idx=%d): startTime=%d masterId=%d order=%d (prev order=%d) delta=%d\n",
-                        b.dbgId, dbgIndex, b.startTime, b.masterId, b.order, lastOrder, deltaFromLastWrap);
+                    int prevRowStart = (lastWrapTime != INT_MIN) ? lastWrapTime : blocks.begin()->startTime;
+                    int fallback = b.startTime - prevRowStart;
+                    distance.push_back(fallback);
+                    sum += fallback;
+                    // Note: hasDistance stays false — a real hasNext block
+                    // in this row can still push distance[++] on its own.
                 }
-                lastWrapTime = b.startTime;
+                if (!firstIter)
+                {
+                    numWraps++;
+                    if (verbose)
+                    {
+                        int deltaFromLastWrap = (lastWrapTime == INT_MIN) ? 0 : b.startTime - lastWrapTime;
+                        printf("wrap at dbgId=%d (idx=%d): startTime=%d masterId=%d order=%d (prev order=%d) delta=%d\n",
+                            b.dbgId, dbgIndex, b.startTime, b.masterId, b.order, lastOrder, deltaFromLastWrap);
+                    }
+                    lastWrapTime = b.startTime;   // only real wraps update lastWrapTime
+                }
+                firstIter = false;
                 hasDistance = false;
             }
         }
@@ -265,23 +287,27 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
     lastOrder = INT_MAX;
     int rowId = -1;
     int lastWrapTimeP2 = INT_MIN;
+    bool firstIterP2 = true;
     Gdiplus::Rect r;
     dbgIndex = 0;
     for (const Block& b : blocks)
     {
         if (b.order < lastOrder)
         {
-            // Same wrap-suppression as pass 1 — ignore spurious mid-rev
-            // order dips (typically caused by physical tape junction sitting
-            // partway through the merged order).
-            bool tooSoon = (lastWrapTimeP2 != INT_MIN &&
+            // Wrap-suppression: skip if the previous REAL wrap was less than
+            // half a rev ago (spurious dip from a mid-rev tape junction).
+            // The very first iteration is the artificial "block 0 < INT_MAX"
+            // trigger — that one always applies (row 0 setup with distance[0]=0).
+            bool tooSoon = (!firstIterP2 && lastWrapTimeP2 != INT_MIN &&
                              (int64_t)(b.startTime - lastWrapTimeP2) < minWrapSpacing);
             if (!tooSoon && rowId + 1 < (int)distance.size())
             {
                 startTime += distance[++rowId];
                 r.Y = (int)(yScale * rowId * VERT_SPACE + 0.5) + margin;
                 r.Height = (int)(yScale + 0.5);
-                lastWrapTimeP2 = b.startTime;
+                if (!firstIterP2)
+                    lastWrapTimeP2 = b.startTime;
+                firstIterP2 = false;
             }
         }
         lastOrder = b.order;

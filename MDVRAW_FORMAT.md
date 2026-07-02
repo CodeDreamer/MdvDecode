@@ -104,3 +104,7 @@ Writers must set `headerSize` to the size actually written (68 for v1.0).
 Readers that encounter a larger `headerSize` should skip the extra bytes
 and continue. Unknown values in `ulaFamily`, `recognizedFileSystem`, or
 `flags` should be treated as "unknown / no assumption".
+`recognizedFileSystem` is just a hint and may become stale if the the
+image gets reformatted in a different format. If an emulator can detect
+the FORMAT command, it could set this field back to unknown, or based on
+the ROM type.
