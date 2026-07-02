@@ -159,6 +159,27 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
 
     g.DrawLine(&lightGreyPen, margin, margin, margin, height - margin);
 
+    // Estimate typical rev-to-rev block distance (median of hasNext deltas)
+    // so we can suppress spurious wraps that occur far too close in time to
+    // the previous one (e.g. when the physical tape junction sits mid-rev
+    // and a block just after junction has a lower order than one just
+    // before, followed shortly by a real rev-boundary block also with lower
+    // order — two apparent wraps per rev).
+    int medianRevDelta = 0;
+    {
+        vector<int> deltas;
+        deltas.reserve(64);
+        for (size_t i = 0; i < blocks.size() && deltas.size() < 64; i++)
+            if (blocks[i].hasNext)
+                deltas.push_back(blocks[blocks[i].nextLoopIndex].startTime - blocks[i].startTime);
+        if (!deltas.empty())
+        {
+            std::sort(deltas.begin(), deltas.end());
+            medianRevDelta = deltas[deltas.size() / 2];
+        }
+    }
+    int minWrapSpacing = medianRevDelta / 2;   // must move >=half a rev forward
+
     vector<int> distance;
     distance.push_back(0);
     int lastOrder = INT_MAX;
@@ -172,19 +193,33 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
     int numWraps = 0;
     for (const Block& b: blocks)
     {
-        //printf("  %d, id=%d\n", b.order, b.masterId);
         if (b.order < lastOrder)
         {
-            //printf("start loop at %d\n", b.order);
-            numWraps++;
-            if (verbose)
+            bool tooSoon = (lastWrapTime != INT_MIN &&
+                             (int64_t)(b.startTime - lastWrapTime) < minWrapSpacing);
+            if (tooSoon)
             {
-                int deltaFromLastWrap = (lastWrapTime == INT_MIN) ? 0 : b.startTime - lastWrapTime;
-                printf("wrap at dbgId=%d (idx=%d): startTime=%d masterId=%d order=%d (prev order=%d) delta=%d\n",
-                    b.dbgId, dbgIndex, b.startTime, b.masterId, b.order, lastOrder, deltaFromLastWrap);
-                lastWrapTime = b.startTime;
+                // Spurious wrap — a block came in out of monotonic order but
+                // we're still in the same physical rev. Ignore for row-count
+                // purposes but keep lastOrder in sync so we can still detect
+                // the real next boundary.
+                if (verbose)
+                    printf("wrap suppressed at dbgId=%d (idx=%d): startTime=%d order=%d (prev order=%d) delta=%d < %d\n",
+                        b.dbgId, dbgIndex, b.startTime, b.order, lastOrder,
+                        b.startTime - lastWrapTime, minWrapSpacing);
             }
-            hasDistance = false;
+            else
+            {
+                numWraps++;
+                if (verbose)
+                {
+                    int deltaFromLastWrap = (lastWrapTime == INT_MIN) ? 0 : b.startTime - lastWrapTime;
+                    printf("wrap at dbgId=%d (idx=%d): startTime=%d masterId=%d order=%d (prev order=%d) delta=%d\n",
+                        b.dbgId, dbgIndex, b.startTime, b.masterId, b.order, lastOrder, deltaFromLastWrap);
+                }
+                lastWrapTime = b.startTime;
+                hasDistance = false;
+            }
         }
         if (!foundSector0 && b.order == 0)
         {
@@ -203,18 +238,23 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
         dbgIndex++;
     }
     if (verbose)
-        printf("Pass 1 collected %zu distance entries for %d wraps\n", distance.size(), numWraps);
+        printf("Pass 1 collected %zu distance entries for %d wraps (min spacing=%d)\n",
+            distance.size(), numWraps, minWrapSpacing);
 
     // Pass 2 does distance[++rowId] once per wrap. If distance is short of
-    // numWraps entries, pass 2 will read past the end. This indicates the
-    // merge left the block ordering inconsistent (e.g. poor Spectrum merge
-    // quality on tapes with lots of overwritten sectors) and rendering would
-    // be misleading anyway. Bail out with a warning.
-    if ((int)distance.size() < numWraps)
+    // numWraps entries, we'd read past the end and either crash or produce
+    // odd geometry. Rather than skipping the whole jpg, pad with the median
+    // of what we have so subsequent rows are just placed at typical spacing.
+    if ((int)distance.size() < numWraps + 1 && distance.size() > 1)
     {
-        printf("Warning: -jpg skipped, block ordering inconsistent (%d wraps, %zu distance entries)\n",
-            numWraps, distance.size());
-        return;
+        vector<int> sortedD(distance.begin() + 1, distance.end());   // skip the leading 0
+        std::sort(sortedD.begin(), sortedD.end());
+        int fill = sortedD.empty() ? 0 : sortedD[sortedD.size() / 2];
+        while ((int)distance.size() < numWraps + 1)
+            distance.push_back(fill);
+        if (verbose)
+            printf("Padded distance array to %zu entries (median=%d) for jpg rendering\n",
+                distance.size(), fill);
     }
 
     int maxDist =  *std::max_element(distance.begin(), distance.end());
@@ -224,19 +264,25 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
 
     lastOrder = INT_MAX;
     int rowId = -1;
+    int lastWrapTimeP2 = INT_MIN;
     Gdiplus::Rect r;
     dbgIndex = 0;
     for (const Block& b : blocks)
     {
         if (b.order < lastOrder)
         {
-            //printf("start loop at %d, row %d\n", b.order, rowId + 1);
-            //if (rowId >= (int)distance.size() - 1)
-            //    break;
-            startTime += distance[++rowId];
-            r.Y = (int)(yScale * rowId * VERT_SPACE + 0.5) + margin;
-            r.Height = (int)(yScale + 0.5);
-
+            // Same wrap-suppression as pass 1 — ignore spurious mid-rev
+            // order dips (typically caused by physical tape junction sitting
+            // partway through the merged order).
+            bool tooSoon = (lastWrapTimeP2 != INT_MIN &&
+                             (int64_t)(b.startTime - lastWrapTimeP2) < minWrapSpacing);
+            if (!tooSoon && rowId + 1 < (int)distance.size())
+            {
+                startTime += distance[++rowId];
+                r.Y = (int)(yScale * rowId * VERT_SPACE + 0.5) + margin;
+                r.Height = (int)(yScale + 0.5);
+                lastWrapTimeP2 = b.startTime;
+            }
         }
         lastOrder = b.order;
 
