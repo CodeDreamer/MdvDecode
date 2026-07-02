@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <numeric>
 #include <unordered_map>
+#include <map>
 #include <memory>
+#include "FitDistance.h"
 
 using namespace std;
 
@@ -101,7 +103,7 @@ struct Block
 #endif
 };
 
-vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Params& params);
+vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Params& params, const char* phase2JpgPath = nullptr);
 
 struct Tape
 {
@@ -169,6 +171,11 @@ std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& block
 
 void DrawError(const vector<int>& fluxData, const vector<int>& alignment);
 void DrawAllBlocks(const vector<Block>& blocks, FileSystem* pFileSys, int firstBlock, const char* jpgPath, bool verbose);
+
+// Diagnostic: visualize block layout and connection state after phase 2 of
+// MergeAllBlocks (hash-match + MakeConnections), before any Overlaps-based
+// placement. Kept separate from DrawAllBlocks; may be removed later.
+void DrawPhase2Layout(const vector<Block>& blockList, int offset, int traceFreq, const char* jpgPath, bool verbose);
 
 #define OS_UNKNOWN 0
 #define OS_QDOS 1

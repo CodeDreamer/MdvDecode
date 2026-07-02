@@ -345,6 +345,8 @@ std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& maste
 			{
 				numBadSectors++;
 				sectorType[i] = SMT_NOT_FOUND;
+				if (params.verbose)
+					printf("  bad sector #%d: no sector in map\n", i);
 			}
 			else
 			{
@@ -352,6 +354,10 @@ std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& maste
 				if (s.data.size < sectorSize || !pFileSys->IsGoodBlock(s.data.pData, sectorSize))
 				{
 					numBadSectors++;
+					if (params.verbose)
+						printf("  bad sector #%d: blockId=%d headerId=%d dataSize=%d %s\n",
+							i, s.blockId, s.headerId, s.data.size,
+							s.data.size < sectorSize ? "(short data)" : "(checksum fail)");
 				}
 				else
 					isGoodSector[i] = true;

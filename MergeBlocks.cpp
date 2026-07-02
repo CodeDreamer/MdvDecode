@@ -348,22 +348,36 @@ struct UniqueBlock
         return startTime < b.startTime;
     }
 
-    bool Overlaps(const UniqueBlock& b)
+    bool Overlaps(const UniqueBlock& b, int pad)
     {
-        int overlap = min(endTime, b.endTime) - max(startTime, b.startTime);
-        if (overlap <= 0)
+        // Require the RAW blocks to actually touch. Padding them into their
+        // neighbors' territory would let disjoint blocks (e.g. OPD's tiny
+        // spurious chunk sitting right after a 16-wide header) false-match.
+        int rawOverlap = min(endTime, b.endTime) - max(startTime, b.startTime);
+        if (rawOverlap <= 0)
             return false;
-        int un = max(endTime, b.endTime) - min(startTime, b.startTime);
+        // Once we know they truly overlap, the pad-expanded IoU gives small
+        // blocks a floor of size tolerance for absolute motor-speed drift.
+        // Large blocks are barely affected; small ones survive drift instead
+        // of being inserted as spurious new UniqueBlocks.
+        int a1 = startTime - pad, a2 = endTime + pad;
+        int b1 = b.startTime - pad, b2 = b.endTime + pad;
+        int overlap = min(a2, b2) - max(a1, b1);
+        int un = max(a2, b2) - min(a1, b1);
         return overlap * 100 / un >= 20;
     }
 };
 
-vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Params& params)
+vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Params& params, const char* phase2JpgPath)
 {
     // Assume a tape needs to be between 5 and 9 seconds long
     // TODO: account for different motor speed of QL vs Interface 1
     int minDuration = params.traceFreq * 5;
     int maxDuration = params.traceFreq * 9;
+    // Absolute per-block drift tolerance for Overlaps(): 1 ms of samples.
+    // Motor-speed variance is a time quantity (typically ~1% over a full rev),
+    // so scale with the trace rate.
+    const int overlapPad = params.traceFreq / 1000;
 
     unordered_map<size_t, int> prevIndexMap;
     vector<int> offsetList;
@@ -454,36 +468,191 @@ vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Para
         printf("Added %d unambiguous good connections\n", numNewConnections);
     //PrintConnections(blockList);
 
-    // Other exact matches at the correct distance, and across an increasing number of loops
-#if 1
-    for (int loop = 1; loop <= 1; loop++)
+    // Collect (src.startTime, dst.startTime - src.startTime) samples from the
+    // STRONG-confirmed connections. Each is an exact observation of the local
+    // cross-rev distance at that src's tape position. We'll use these to
+    // interpolate an expected offset per-candidate in the loop=1 pass.
+    vector<double> greenSampleT, greenSampleD;  // green is the color of these links in the JPG
+    greenSampleT.reserve(blockList.size());
+    greenSampleD.reserve(blockList.size());
+    for (size_t i = 0; i < blockList.size(); i++)
     {
-        int multiLoopOffset = offset * loop;
-        connectionList.clear();
-        for (size_t i = 0; i < blockList.size(); i++)
-        {
-            Block& block = blockList[i];
-            if (!block.hasNext)
-            {
-                int next = block.nextLoopIndex;
-                while (next > 0)
-                {
-                    const Block& bNext = blockList[next];
-                    int distance = abs(bNext.startTime - block.startTime - multiLoopOffset);
-                    if (distance <= maxOffsetMargin && bNext.previousLoopIndex == -1)
-                        connectionList.push_back({ distance, (int)i, next });
-                    next = bNext.nextLoopIndex;
-                }
-            }
-        }
-        numNewConnections = MakeConnections(blockList, connectionList, NT_OTHER, loop == 1);
-        if (params.verbose && numNewConnections)
-            printf("Added %d good connections at a distance of %d tape loops\n", numNewConnections, loop);
+        const Block& b = blockList[i];
+        if (!b.hasNext || b.nextLoopIndex < 0) continue;
+        const Block& n = blockList[b.nextLoopIndex];
+        greenSampleT.push_back((double)b.startTime);
+        greenSampleD.push_back((double)(n.startTime - b.startTime));
     }
-#endif
+
+    // Loop=1: for each unconnected src, walk the phase-1 hash chain and score
+    // candidates against the INTERPOLATED expected offset (from surrounding
+    // green links). Candidates whose src falls outside the bracketed green-sample
+	// range are refused — we don't have enough local information to trust a link
+	// at trace edges.
+    //
+    // Margin is adaptive: proportional to the GAP between the two bracketing
+    // green samples. A small gap means we know the local rev-distance
+    // precisely and the motor can't have drifted much since the last known
+    // link, so we tolerate very little error. A big gap allows more slack.
+    connectionList.clear();
+    const double GAP_FRACTION_MARGIN = 0.05;   // 5% of bracket gap
+    const int MIN_MARGIN = 1000;               // ~40 μs @ 24 MHz floor
+    for (size_t i = 0; i < blockList.size(); i++)
+    {
+        Block& block = blockList[i];
+        if (block.hasNext) continue;
+        double srcT = (double)block.startTime;
+        if (greenSampleT.empty() || srcT < greenSampleT.front() || srcT > greenSampleT.back())
+            continue;
+        // Bracket srcT between two green samples for both the interpolated
+        // expected offset AND the gap-based margin.
+        auto it = std::upper_bound(greenSampleT.begin(), greenSampleT.end(), srcT);
+        if (it == greenSampleT.begin() || it == greenSampleT.end()) continue;
+        int idxHi = (int)(it - greenSampleT.begin());
+        int idxLo = idxHi - 1;
+        double gap = greenSampleT[idxHi] - greenSampleT[idxLo];
+        double frac = gap > 0 ? (srcT - greenSampleT[idxLo]) / gap : 0.0;
+        double expectedOffset = greenSampleD[idxLo] + frac * (greenSampleD[idxHi] - greenSampleD[idxLo]);
+        int localMargin = std::max(MIN_MARGIN, (int)(gap * GAP_FRACTION_MARGIN));
+
+        int next = block.nextLoopIndex;
+        while (next > 0)
+        {
+            const Block& bNext = blockList[next];
+            int distance = abs((int)(bNext.startTime - block.startTime - expectedOffset));
+            if (distance <= localMargin && bNext.previousLoopIndex == -1)
+                connectionList.push_back({ distance, (int)i, next });
+            next = bNext.nextLoopIndex;
+        }
+    }
+    numNewConnections = MakeConnections(blockList, connectionList, NT_OTHER, true);
+    if (params.verbose && numNewConnections)
+        printf("Added %d loop=1 connections (interpolated local offset, adaptive margin)\n", numNewConnections);
 
     if (params.verbose)
+    {
+        // ---------------------------------------------------------------------
+        // Chain slant analysis: for each CONFIRMED connection (hasNext), compute
+        // the X-drift (block-position within a rev, mod offset). Vertical lines
+        // in the phase2 layout <=> zero drift; slant grows with drift.
+        // Broken out by rev-of-source so first-vs-later revs can be compared.
+        // ---------------------------------------------------------------------
+        map<int, int> slantByRev_count;
+        map<int, long long> slantByRev_absSum;
+        map<int, int> slantByRev_maxAbs;
+        int totalConfirmed = 0;
+        for (size_t i = 0; i < blockList.size(); i++)
+        {
+            const Block& b = blockList[i];
+            if (!b.hasNext || b.nextLoopIndex < 0) continue;
+            const Block& n = blockList[b.nextLoopIndex];
+            int rev = b.startTime / offset;
+            // Drift = actual distance minus expected offset. Positive = dst
+            // arrived later than expected (motor slower than the loopDistance
+            // estimate); negative = earlier. This measure is not affected by
+            // rev-boundary wrap.
+            int slant = (n.startTime - b.startTime) - offset;
+            slantByRev_count[rev]++;
+            slantByRev_absSum[rev] += abs(slant);
+            if (abs(slant) > slantByRev_maxAbs[rev]) slantByRev_maxAbs[rev] = abs(slant);
+            totalConfirmed++;
+        }
+        printf("Chain-slant by source rev (sample units, 24 MHz => 24k = 1 ms):\n");
+        for (auto& kv : slantByRev_count)
+        {
+            int r = kv.first;
+            int n = kv.second;
+            long long avg = slantByRev_absSum[r] / n;
+            printf("  rev=%d  n=%d  avg_|slant|=%lld  max_|slant|=%d\n",
+                r, n, avg, slantByRev_maxAbs[r]);
+        }
+
+        // ---------------------------------------------------------------------
+        // Non-green (isolated / short chain) position histogram: bin by
+        // startTime % offset into 100 bins across one rev. Reveals whether the
+        // damaged clusters sit at fixed tape positions.
+        // ---------------------------------------------------------------------
+        const int NUM_BINS = 100;
+        vector<int> greenBins(NUM_BINS, 0);
+        vector<int> nonGreenBins(NUM_BINS, 0);
+        // Recompute chainLen for coloring
+        vector<bool> isHead(blockList.size(), true);
+        for (const Block& b : blockList)
+            if (b.hasNext && b.nextLoopIndex >= 0)
+                isHead[b.nextLoopIndex] = false;
+        vector<int> chainLenLocal(blockList.size(), 1);
+        for (size_t i = 0; i < blockList.size(); i++)
+        {
+            if (!isHead[i]) continue;
+            int len = 1, cur = (int)i;
+            while (blockList[cur].hasNext && blockList[cur].nextLoopIndex >= 0)
+            { cur = blockList[cur].nextLoopIndex; len++; }
+            cur = (int)i; chainLenLocal[cur] = len;
+            while (blockList[cur].hasNext && blockList[cur].nextLoopIndex >= 0)
+            { cur = blockList[cur].nextLoopIndex; chainLenLocal[cur] = len; }
+        }
+        int solidThreshold = numLoops - 1;
+        if (solidThreshold < 2) solidThreshold = 2;
+        for (size_t i = 0; i < blockList.size(); i++)
+        {
+            int xInRev = blockList[i].startTime % offset;
+            int bin = (int)((long long)xInRev * NUM_BINS / offset);
+            if (bin < 0) bin = 0;
+            if (bin >= NUM_BINS) bin = NUM_BINS - 1;
+            if (chainLenLocal[i] >= solidThreshold) greenBins[bin]++;
+            else nonGreenBins[bin]++;
+        }
+        printf("Non-green cluster density per rev-position bin (bin=%.1fms):\n",
+            (double)offset / NUM_BINS / (params.traceFreq / 1000.0));
+        printf("  bin  green non_green  green%%\n");
+        for (int b = 0; b < NUM_BINS; b++)
+        {
+            int tot = greenBins[b] + nonGreenBins[b];
+            if (tot == 0) continue;
+            int pct = 100 * greenBins[b] / tot;
+            // Only print interesting bins: heavy non-green
+            if (nonGreenBins[b] >= greenBins[b] || nonGreenBins[b] >= 5)
+                printf("  %3d  %5d %5d       %3d%%\n", b, greenBins[b], nonGreenBins[b], pct);
+        }
+
+        // Phase 2 quality: how long are the connection chains?
+        // Ideal: each real block forms one chain of length ~numLoops (~6 for a
+        // 6.1-rev tape). Short chains mean phase 2 lost track partway through.
+        vector<bool> isChainHead(blockList.size(), true);
+        for (const Block& b : blockList)
+            if (b.hasNext && b.nextLoopIndex >= 0)
+                isChainHead[b.nextLoopIndex] = false;
+
+        map<int, int> chainLenHist;   // len -> count
+        int totalChains = 0;
+        int totalNodes = 0;
+        int isolatedNodes = 0;
+        for (size_t i = 0; i < blockList.size(); i++)
+        {
+            if (!isChainHead[i]) continue;
+            int len = 1;
+            int cur = (int)i;
+            while (blockList[cur].hasNext && blockList[cur].nextLoopIndex >= 0)
+            {
+                cur = blockList[cur].nextLoopIndex;
+                len++;
+            }
+            chainLenHist[len]++;
+            totalChains++;
+            totalNodes += len;
+            if (len == 1) isolatedNodes++;
+        }
+        printf("Phase 2 chain-length histogram (chain_len : #chains  covers_blocks):\n");
+        for (auto& kv : chainLenHist)
+            printf("  len=%d : %d chains  (%d blocks)\n", kv.first, kv.second, kv.first * kv.second);
+        printf("  totals: %d chains  %d blocks  isolated=%d  numLoops estimate=%d\n",
+            totalChains, totalNodes, isolatedNodes, numLoops);
+
         PrintConnections(blockList);
+    }
+
+    if (phase2JpgPath)
+        DrawPhase2Layout(blockList, offset, params.traceFreq, phase2JpgPath, params.verbose);
 
 
     size_t top = blockList.size();
@@ -491,7 +660,6 @@ vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Para
         top--;
 
     // Finally create master list of all unique blocks and place any remaing unmatched blocks
-    //unordered_map<int, int> previous;
     vector<UniqueBlock> masterList;
     int iFirst = 0;
     while (iFirst < blockList.size() && !blockList[iFirst].hasNext)
@@ -501,34 +669,65 @@ vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Para
         int j = blockList[iFirst].nextLoopIndex;
         for (int i = iFirst; i < j; i++)
             masterList.emplace_back(UniqueBlock(i, &blockList[i]));
-        masterList.emplace_back(UniqueBlock(j, &blockList[j]));    // Special ending block to simplify wrap-around logic
-        int loopDistance = blockList[j].startTime - blockList[iFirst].startTime;
+
+        double t0 = (double)blockList[iFirst].startTime;
+
+        // Build shift samples from the phase-2 hash chains: for each block c
+        // that is a chain member and whose chain root is a rev-0 block, we
+        // know exactly the shift needed to bring c into rev-0 frame:
+        //   shift = c.startTime - chain_root.startTime
+        // These are direct observations, no fit noise. Query() then linearly
+        // interpolates between them for blocks not directly in a chain.
+        vector<double> sampleT, sampleShift;
+        sampleT.reserve(blockList.size());
+        sampleShift.reserve(blockList.size());
+        for (size_t c = 0; c < blockList.size(); c++)
+        {
+            const Block& bc = blockList[c];
+            if (bc.previousLoopIndex < 0 && !bc.hasNext) continue;
+            // Walk back to chain root.
+            int root = (int)c;
+            while (blockList[root].previousLoopIndex >= 0)
+                root = blockList[root].previousLoopIndex;
+            // Only include if the root is a rev-0 block (index in [iFirst, j))
+            // — that anchors the shift meaning to the same rev-0 frame that
+            // masterList is built in.
+            if (root < iFirst || root >= j) continue;
+            sampleT.push_back((double)bc.startTime);
+            sampleShift.push_back((double)(bc.startTime - blockList[root].startTime));
+        }
+
+        LoopDistanceState ldState;
+        ldState.Init(sampleT, sampleShift);
+
+        if (params.verbose)
+        {
+            double rawIF2J = blockList[j].startTime - blockList[iFirst].startTime;
+            int shiftAtJ = ldState.Query((double)blockList[j].startTime);
+            printf("Phase 3 init: iFirst=%d j=%d t0=%.0f raw_iF-to-j=%.0f shift(j)=%d  chain_samples=%zu\n",
+                iFirst, j, t0, rawIF2J, shiftAtJ, sampleT.size());
+        }
+
+        int insertCount = 0;
+        int overlapCount = 0;
+        int dbgQueries = 0;
         for (; j < blockList.size(); j++)
         {
-            //Block& block = blockList[j];
             UniqueBlock jBlock(j, &blockList[j]);
-            jBlock.startTime -= loopDistance;
-            jBlock.endTime -= loopDistance;
-            int numSearches = 2;
-            int k = -1;
-            while (--numSearches >= 0)
+            int shift = ldState.Query((double)blockList[j].startTime);
+            if (params.verbose && dbgQueries < 5)
             {
-                k = lower_bound(masterList.begin(), masterList.end(), jBlock) - masterList.begin();
-                //[&blockList](const UniqueBlock& x, const UniqueBlock& y) { return x.startTime < y.startTime;}) - masterList.begin();
-                int end = masterList.size();
-                if (k == end || (k == end - 1 && !(jBlock.Overlaps(masterList[end - 2]))))
-                {
-                    // Wrap around
-                    int extraDistance = masterList.back().startTime - masterList.front().startTime;
-                    loopDistance += extraDistance;
-                    jBlock.startTime -= extraDistance;
-                    jBlock.endTime -= extraDistance;
-                }
-                else
-                    break;
+                printf("  Query[%d]: j=%d startTime=%d shift=%d jBlock.start=%d\n",
+                    dbgQueries, j, blockList[j].startTime, shift,
+                    blockList[j].startTime - shift);
+                dbgQueries++;
             }
-            if (k == 0)
-                k = 1;
+            jBlock.startTime -= shift;
+            jBlock.endTime -= shift;
+
+            int k = (int)(lower_bound(masterList.begin(), masterList.end(), jBlock) - masterList.begin());
+            if (k >= (int)masterList.size()) k = (int)masterList.size() - 1;
+            if (k == 0) k = 1;
             int previous = k - 1;
             int next = k;
             if (k > 0 && jBlock.startTime - masterList[k - 1].startTime < masterList[k].startTime - jBlock.startTime)
@@ -540,36 +739,38 @@ vector<Block> MergeAllBlocks(vector<Block>& blockList, int totalTime, const Para
             {
                 // k already likely to be correct
             }
-            else if (jBlock.Overlaps(masterList[previous]))
+            else if (jBlock.Overlaps(masterList[previous], overlapPad))
                 k = previous;
-            else if (jBlock.Overlaps(masterList[next]))
+            else if (jBlock.Overlaps(masterList[next], overlapPad))
                 k = next;
-            else if (true)
+            else
             {
                 if (params.verbose)
-                    printf("Insert %d [%d - %d] between %d [%d - %d] and %d [%d - %d]\n",
+                    printf("Insert %d [%d - %d] between %d [%d - %d] and %d [%d - %d] (k=%d masterList.size=%d)\n",
                         j, jBlock.startTime / 1000, jBlock.endTime / 1000,
                         masterList[previous].pLastBlock->dbgId,
                         masterList[previous].startTime / 1000, masterList[previous].endTime / 1000,
                         masterList[next].pLastBlock->dbgId,
-                        masterList[next].startTime / 1000, masterList[next].endTime / 1000);
-                // In between or with only small overlap
-                // Insert block in between
-                // if(jBlock.startTime > masterList[previous].endTime && jBlock.endTime < masterList[next].startTime)
+                        masterList[next].startTime / 1000, masterList[next].endTime / 1000,
+                        k, (int)masterList.size());
                 masterList.insert(masterList.begin() + next, jBlock);
                 blockList[j].gapLen = jBlock.startTime - masterList[previous].endTime;
                 masterList[next].pFirstBlock->gapLen = masterList[next].startTime - jBlock.endTime;
                 bOverlap = false;
+                insertCount++;
             }
             if (bOverlap)
             {
-                int catchupFactor = (blockList[j].previousLoopIndex >= 0 && masterList[k].pLastBlock->nextLoopIndex == j) ? 2 : 10;
-                loopDistance += (jBlock.startTime - masterList[k].startTime) / catchupFactor;
                 masterList[k].AddBlock(j, &blockList[j], params.verbose);
+                overlapCount++;
             }
         }
+        if (params.verbose)
+        {
+            printf("MergeAllBlocks summary (spline L(t)): insertions=%d overlaps=%d masterList.size=%d\n",
+                insertCount, overlapCount, (int)masterList.size());
+        }
     }
-    masterList.pop_back();  // Remove the extra block at the end
 
 
 #if 0

@@ -299,3 +299,194 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
     mbstowcs_s(&converted, wPath, jpgPath, _TRUNCATE);
     SaveJpeg(hBitmap, wPath, 80);
 }
+
+// =============================================================================
+// Phase 2 diagnostic layout
+// =============================================================================
+//
+// Visualizes blockList right after MakeConnections (hash-based chain
+// scaffolding) and BEFORE the Overlaps-based placement pass. Layout:
+//   Y = startTime / offset  (rev index; ~7 rows for a 6.1-rev tape)
+//   X = startTime % offset  (position within one revolution)
+//
+// Block fill colors reveal scaffolding quality:
+//   green   = block is in a confirmed chain of length >= numLoops-1  (solid scaffold)
+//   yellow  = block is in a shorter chain (2..numLoops-2)             (partial)
+//   red     = block is isolated (chain of length 1)                   (no scaffold)
+//   pale    = block has a hash-match pointer but the connection was not confirmed
+//
+// Lines show the connections:
+//   solid green    = confirmed unambiguous match (NT_STRONG)
+//   dashed green   = confirmed loop=1 match (NT_OTHER)
+//   thin gray      = hash-match, not confirmed
+//
+// For blocks that look like ZX Spectrum headers (small block, header flag set),
+// the sector number (data[1]) is printed inside the block.
+void DrawPhase2Layout(const vector<Block>& blockList, int offset, int traceFreq, const char* jpgPath, bool verbose)
+{
+    if (blockList.empty() || offset <= 0)
+        return;
+
+    // Estimate number of revs from the maximum startTime
+    int maxStart = 0;
+    for (const Block& b : blockList)
+        if (b.startTime > maxStart) maxStart = b.startTime;
+    int numRevs = maxStart / offset + 1;
+    if (numRevs < 1) numRevs = 1;
+    if (numRevs > 20) numRevs = 20;  // sanity cap
+
+    // Compute chain length that each block belongs to
+    vector<int> chainLen(blockList.size(), 1);
+    vector<bool> isChainHead(blockList.size(), true);
+    for (size_t i = 0; i < blockList.size(); i++)
+        if (blockList[i].hasNext && blockList[i].nextLoopIndex >= 0)
+            isChainHead[blockList[i].nextLoopIndex] = false;
+    for (size_t i = 0; i < blockList.size(); i++)
+    {
+        if (!isChainHead[i]) continue;
+        int len = 1;
+        int cur = (int)i;
+        while (blockList[cur].hasNext && blockList[cur].nextLoopIndex >= 0)
+        {
+            cur = blockList[cur].nextLoopIndex;
+            len++;
+        }
+        // Walk again and assign length to every node in this chain
+        cur = (int)i;
+        chainLen[cur] = len;
+        while (blockList[cur].hasNext && blockList[cur].nextLoopIndex >= 0)
+        {
+            cur = blockList[cur].nextLoopIndex;
+            chainLen[cur] = len;
+        }
+    }
+
+    // Layout constants
+    const int margin = 40;
+    const int rowHeight = 60;
+    const int labelBand = 18;   // strip above each row for sector-number labels
+    const int rowGap = 8;
+    const int height = margin * 2 + numRevs * (rowHeight + labelBand + rowGap);
+    const int width = 11000;
+    const double xScale = (double)(width - margin * 2) / offset;
+
+    Bitmap bmp(width, height, PixelFormat32bppARGB);
+    Graphics g(&bmp);
+    Pen blackPen(Color(255, 0, 0, 0), 2);
+    Pen thinGrayPen(Color(255, 180, 180, 180), 1);
+    Pen strongGreenPen(Color(255, 16, 160, 16), 2);
+    Pen otherGreenPen(Color(255, 16, 160, 16), 1);
+    otherGreenPen.SetDashStyle(DashStyleDash);
+    Pen lightGridPen(Color(255, 220, 220, 220), 1);
+    SolidBrush whiteBrush(Color(255, 255, 255, 255));
+    SolidBrush blackBrush(Color(255, 0, 0, 0));
+    SolidBrush solidGreenBrush(Color(255, 128, 220, 128));
+    SolidBrush yellowBrush(Color(255, 240, 220, 128));
+    SolidBrush redBrush(Color(255, 240, 128, 128));
+    SolidBrush paleBrush(Color(255, 220, 220, 220));
+
+    g.FillRectangle(&whiteBrush, 0, 0, width, height);
+
+    // Row baselines and labels
+    Gdiplus::Font labelFont(L"Consolas", 10, FontStyleRegular, UnitPixel);
+    for (int r = 0; r < numRevs; r++)
+    {
+        int y = margin + r * (rowHeight + labelBand + rowGap) + labelBand;
+        g.DrawLine(&lightGridPen, margin, y, width - margin, y);
+        WCHAR label[32];
+        swprintf_s(label, L"rev %d", r);
+        g.DrawString(label, -1, &labelFont, PointF((REAL)(margin - 34), (REAL)y), &blackBrush);
+    }
+
+    // Consider a chain "solid" if it covers at least (numRevs - 1) blocks —
+    // allows one dropped revolution.
+    const int solidLen = numRevs > 1 ? numRevs - 1 : numRevs;
+
+    Gdiplus::Font sectorFont(L"Consolas", 12, FontStyleBold, UnitPixel);
+    int drawnSectorLabels = 0;
+
+    for (size_t i = 0; i < blockList.size(); i++)
+    {
+        const Block& b = blockList[i];
+        int rev = b.startTime / offset;
+        if (rev < 0 || rev >= numRevs) continue;
+        int tInRev = b.startTime % offset;
+        int rectX = margin + (int)(xScale * tInRev + 0.5);
+        int rectW = (int)(xScale * (b.endTime - b.startTime) + 0.5);
+        if (rectW < 1) rectW = 1;
+        int rowTop = margin + rev * (rowHeight + labelBand + rowGap);
+        int rectY = rowTop + labelBand;
+
+        SolidBrush* pFill;
+        if (chainLen[i] >= solidLen) pFill = &solidGreenBrush;
+        else if (chainLen[i] >= 2)   pFill = &yellowBrush;
+        else if (b.nextLoopIndex >= 0 || (i > 0 && blockList[i - 1].nextLoopIndex == (int)i))
+            pFill = &paleBrush;
+        else                          pFill = &redBrush;
+        g.FillRectangle(pFill, rectX, rectY, rectW, rowHeight);
+        g.DrawRectangle(&blackPen, rectX, rectY, rectW, rowHeight);
+
+        // Label the block with its sector number iff it looks structurally
+        // like a real sector header:
+        //   OPD    - 14 bytes starting with 0xFF, sector number at byte 1
+        //   ZX Spectrum - 15 bytes with byte 0's flag bit set, sector number at byte 1
+        // The size floor also excludes OPD's 4-byte "block header" (which
+        // holds fileNum/blockNum, not the sector number) so its byte 1 doesn't
+        // draw an overlapping bogus label next to the real sector-header one.
+        bool isOpdSectorHeader = b.data.size() == 14 && b.data[0] == 0xFF;
+        bool isZxSectorHeader  = b.data.size() == 15 && (b.data[0] & 1) == 1;
+        if (isOpdSectorHeader || isZxSectorHeader)
+        {
+            WCHAR num[8];
+            swprintf_s(num, L"%d", b.data[1]);
+            // Leader tick from label to block
+            g.DrawLine(&thinGrayPen, rectX + rectW / 2, rowTop + labelBand - 2, rectX + rectW / 2, rectY);
+            g.DrawString(num, -1, &sectorFont, PointF((REAL)(rectX - 6), (REAL)rowTop), &blackBrush);
+            drawnSectorLabels++;
+        }
+    }
+
+    // Connection lines: draw AFTER blocks so they sit on top of fills.
+    for (size_t i = 0; i < blockList.size(); i++)
+    {
+        const Block& b = blockList[i];
+        if (b.nextLoopIndex < 0 || b.nextLoopIndex >= (int)blockList.size()) continue;
+        const Block& n = blockList[b.nextLoopIndex];
+        int rev1 = b.startTime / offset;
+        int rev2 = n.startTime / offset;
+        if (rev1 < 0 || rev1 >= numRevs || rev2 < 0 || rev2 >= numRevs) continue;
+        int tIn1 = b.startTime % offset;
+        int tIn2 = n.startTime % offset;
+        int x1 = margin + (int)(xScale * (tIn1 + (b.endTime - b.startTime) / 2) + 0.5);
+        int y1 = margin + rev1 * (rowHeight + labelBand + rowGap) + labelBand + rowHeight;
+        int x2 = margin + (int)(xScale * (tIn2 + (n.endTime - n.startTime) / 2) + 0.5);
+        int y2 = margin + rev2 * (rowHeight + labelBand + rowGap) + labelBand;
+
+        Pen* pPen;
+        if (b.hasNext && b.nextType == NT_STRONG) pPen = &strongGreenPen;
+        else if (b.hasNext)                       pPen = &otherGreenPen;
+        else                                      pPen = &thinGrayPen;
+        g.DrawLine(pPen, x1, y1, x2, y2);
+    }
+
+    // Legend
+    Gdiplus::Font legendFont(L"Consolas", 12, FontStyleRegular, UnitPixel);
+    WCHAR summary[256];
+    swprintf_s(summary,
+        L"Phase 2 layout: %d blocks  offset=%d samples (%.2fs @ %d MHz)  numRevs=%d  sectorNums shown for %d blocks",
+        (int)blockList.size(), offset, (double)offset / traceFreq, traceFreq / 1000000,
+        numRevs, drawnSectorLabels);
+    g.DrawString(summary, -1, &legendFont, PointF(margin, 8), &blackBrush);
+
+    if (verbose)
+        printf("DrawPhase2Layout: numRevs=%d bitmap=%dx%d headerLabels=%d\n",
+            numRevs, width, height, drawnSectorLabels);
+
+    HBITMAP hBitmap;
+    bmp.GetHBITMAP(Color::Black, &hBitmap);
+
+    WCHAR wPath[MAX_PATH];
+    size_t converted = 0;
+    mbstowcs_s(&converted, wPath, jpgPath, _TRUNCATE);
+    SaveJpeg(hBitmap, wPath, 80);
+}

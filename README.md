@@ -100,7 +100,8 @@ Options:
 
 If `<output_file>` is omitted, `<input_directory>.MDVRAW` is written next
 to the input. The `-jpg` output is written next to the `.MDVRAW` with the
-same base name.
+same base name. Using both -jpg and -verbose also generates a second diagnostic
+diagram showing intermediate block-matching results.
 
 
 ### Examples
@@ -161,10 +162,10 @@ The `.MDVRAW` file format is documented in [MDVRAW_FORMAT.md](MDVRAW_FORMAT.md).
 - **QL microdrives** (QDOS, GST 68K/OS): working well, file listings and
   checksums verified against multiple test cartridges.
 - **ICL OPD** ("One Per Desk"): working with `-opd`.
-- **ZX Spectrum (Interface 1)**: use the `-zx` option, but decoding is currently
-  broken. It used to work, but the new logic to align and merge similar blocks that
-  is more robust for QL cartridges is also causing issues for ZX.
+- **ZX Spectrum (Interface 1)**: use the `-zx` option. So far only tried with
+  logic traces collected on a QL. It may or may not work with traces collected
+  on the Spectrum, depending on how close the motor speed is.
 
 ## License
 
-GPL v3 or later. See `LICENSE`.
+GPL v3 or later. See [LICENSE](LICENSE).

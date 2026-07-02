@@ -51,6 +51,9 @@
     <ClCompile Include="FileSystem_OPD.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="FitDistance.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="MdvDecode.h">
@@ -59,8 +62,16 @@
     <ClInclude Include="Track.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="FitDistance.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="OPD_Format_Notes.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="LogicTrace.md" />
+    <None Include="MDVRAW_FORMAT.md" />
+    <None Include="README.md" />
   </ItemGroup>
 </Project>

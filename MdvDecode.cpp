@@ -704,7 +704,21 @@ int main(int argc, char* argv[])
     //==================================================================================================
     // Try to match copies of the same blocks across multiple tape revolutions and merge them together
     //==================================================================================================
-    vector<Block> masterBlocks = MergeAllBlocks(allBlocks, time, params);
+    // Phase 2 JPG (+ CSV) is a deep-dive diagnostic — only emit when both
+    // -jpg and -verbose are set, so casual -jpg users just get the main
+    // block-layout image (from DrawAllBlocks) without extra artifacts.
+    string phase2JpgPath;
+    bool wantPhase2Jpg = saveJpg && params.verbose;
+    if (wantPhase2Jpg)
+    {
+        phase2JpgPath = outputFile;
+        size_t dot = phase2JpgPath.find_last_of('.');
+        size_t slash = phase2JpgPath.find_last_of("/\\");
+        if (dot != string::npos && (slash == string::npos || dot > slash))
+            phase2JpgPath.resize(dot);
+        phase2JpgPath += "_phase2.jpg";
+    }
+    vector<Block> masterBlocks = MergeAllBlocks(allBlocks, time, params, wantPhase2Jpg ? phase2JpgPath.c_str() : nullptr);
 
     //==========================================================================
     // Guess the OS that formatted the cartridge and print some stats

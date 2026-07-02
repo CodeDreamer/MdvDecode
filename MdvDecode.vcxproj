@@ -134,6 +134,7 @@
     <ClCompile Include="FileSystem_OPD.cpp" />
     <ClCompile Include="FileSystem_QDOS.cpp" />
     <ClCompile Include="FileSystem_Spectrum.cpp" />
+    <ClCompile Include="FitDistance.cpp" />
     <ClCompile Include="Flux.cpp" />
     <ClCompile Include="FluxHistogram.cpp" />
     <ClCompile Include="MdvDecode.cpp" />
@@ -143,11 +144,17 @@
     <ClCompile Include="Track.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="FitDistance.h" />
     <ClInclude Include="MdvDecode.h" />
     <ClInclude Include="Track.h" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="OPD_Format_Notes.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="LogicTrace.md" />
+    <None Include="MDVRAW_FORMAT.md" />
+    <None Include="README.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
