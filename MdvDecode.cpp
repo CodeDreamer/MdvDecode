@@ -493,6 +493,7 @@ void ExportSpeed(const vector<Block>& blockList, const Params& params)
 
 int main(int argc, char* argv[])
 {
+    printf("MdvDecode 1.0 by Daniele Terdina\n");
     Params params;
     params.verbose = false;
     params.blockHeaderLen = 0;
