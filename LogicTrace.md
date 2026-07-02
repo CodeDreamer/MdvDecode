@@ -44,10 +44,12 @@ No other connections are needed.
 2. Connect the analyzer to the two data lines and GND (side microdrive
    connector on the QL, or inside it).
 3. Boot the QL (a standard Sinclair or Minerva ROM is fine even for non-QDOS
-   cartridges), insert the cartridge, and turn the motor on. A tiny
-   SuperBASIC extension with `MDV_ON <drive_num>` / `MDV_OFF` commands is
-   available at <http://www.terdina.net/ql/soft/motor_bin> — it may or may not
-   work depending on your hardware (Gold Card, vMap, ULA condition).
+   cartridges).
+   Insert the cartridge, turn the motor on and wait a few seconds for it to
+   reach full speed. A tiny SuperBASIC extension with `MDV_ON <drive_num>`
+   and `MDV_OFF` commands is available at
+   <http://www.terdina.net/ql/soft/motor_bin> — it may or may not work
+   depending on your hardware (Gold Card, vMap, ULA condition).
 4. In PulseView, set 1 G samples at 24 MHz and click Run.
    Capture takes under a minute and records at least five revolutions of the
    tape.
