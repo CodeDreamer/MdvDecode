@@ -381,9 +381,14 @@ std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& maste
 					numBad++;
 			printf("  %d %s", f.length, f.name.c_str());
 			if (numBad)
-				printf(" (%d bad sectors)\n", numBad);
-			else
-				printf("\n");
+			{
+				printf(" (%d bad sectors:", numBad);
+				for (int s : f.sectors)
+					if (s < 0 || !isGoodSector[s])
+						printf(" #%d", s);
+				printf(")");
+			}
+			printf("\n");
 		}
 	}
 

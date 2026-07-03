@@ -76,20 +76,18 @@ private:
 
 static GdiplusInit initGraphics;
 
-void DrawError(const vector<int>& fluxData, const vector<int>& alignment)
+static void DrawErrorImpl(const vector<int>& fluxData, const vector<int>& alignment,
+    const vector<int>* bitValues, LPCWSTR path)
 {
-    static int id = 0;
-
     const int width = 4000;
     const int height = 120;
     const int waveHeight = 30;
-    //Create a bitmap
     Bitmap bmp(width, height, PixelFormat32bppARGB);
     Graphics g(&bmp);
     Pen blackPen(Color(255, 0, 0, 0), 3);
     Pen lightGreyPen(Color(255, 200, 200, 200), 3);
     SolidBrush whiteBrush(Color(255, 255, 255, 255));
-
+    SolidBrush bitBrush(Color(255, 0, 96, 200));   // decoded 0/1 labels
 
     size_t start = 0;
     int timeStart = 0;
@@ -104,7 +102,6 @@ void DrawError(const vector<int>& fluxData, const vector<int>& alignment)
         timeStart = time;
     }
 
-    // Erase background
     g.FillRectangle(&whiteBrush, 0, 0, width, height);
 
     for (int t : alignment)
@@ -113,11 +110,31 @@ void DrawError(const vector<int>& fluxData, const vector<int>& alignment)
         g.DrawLine(&lightGreyPen, x, 0, x, height);
     }
 
+    // Overlay the decoded bit value (0 or 1) inside each cell — the interval
+    // [alignment[i], alignment[i+1]) is the cell whose result is bitValues[i].
+    if (bitValues && !bitValues->empty())
+    {
+        Gdiplus::Font font(L"Consolas", 14, FontStyleBold, UnitPixel);
+        size_t nCells = min(alignment.size() > 0 ? alignment.size() - 1 : 0, bitValues->size());
+        for (size_t i = 0; i < nCells; i++)
+        {
+            int x1 = (alignment[i]     - timeStart) / 6;
+            int x2 = (alignment[i + 1] - timeStart) / 6;
+            int mid = (x1 + x2) / 2;
+            if (mid < 0 || mid > width) continue;
+            const WCHAR* s = (*bitValues)[i] ? L"1" : L"0";
+            g.DrawString(s, -1, &font, PointF((REAL)(mid - 4), 2), &bitBrush);
+        }
+    }
+
     const int waveHigh = (height - waveHeight) / 2;
     const int waveLow = height - waveHeight;
     bool state = true;
     int lastX = 0;
-    int time = 0;
+    // Start `time` at the accumulated sample time of flux[start], not zero:
+    // the wave loop skips the pre-window flux, and `timeStart` holds where
+    // that skipped portion ended..
+    int time = timeStart;
     for (size_t i = start; i < fluxData.size(); i++)
     {
         time += fluxData[i];
@@ -133,7 +150,29 @@ void DrawError(const vector<int>& fluxData, const vector<int>& alignment)
 
     HBITMAP hBitmap;
     bmp.GetHBITMAP(Color::Black, &hBitmap);
-    SaveJpeg(hBitmap, L"error.jpg", 80);
+    SaveJpeg(hBitmap, path, 80);
+}
+
+void DrawError(const vector<int>& fluxData, const vector<int>& alignment)
+{
+    DrawErrorImpl(fluxData, alignment, nullptr, L"error.jpg");
+}
+
+void DrawErrorNamed(const vector<int>& fluxData, const vector<int>& alignment, const char* path)
+{
+    WCHAR wPath[MAX_PATH];
+    size_t converted = 0;
+    mbstowcs_s(&converted, wPath, path, _TRUNCATE);
+    DrawErrorImpl(fluxData, alignment, nullptr, wPath);
+}
+
+void DrawErrorNamedBits(const vector<int>& fluxData, const vector<int>& alignment,
+    const vector<int>& bitValues, const char* path)
+{
+    WCHAR wPath[MAX_PATH];
+    size_t converted = 0;
+    mbstowcs_s(&converted, wPath, path, _TRUNCATE);
+    DrawErrorImpl(fluxData, alignment, &bitValues, wPath);
 }
 
 void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstBlock, const char* jpgPath, bool verbose)
@@ -386,14 +425,18 @@ void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstB
 //   yellow  = block is in a shorter chain (2..numLoops-2)             (partial)
 //   red     = block is isolated (chain of length 1)                   (no scaffold)
 //   pale    = block has a hash-match pointer but the connection was not confirmed
+// 
+// Red numbers 1 or 2 inside the blocks mean that the corresponding track has some
+// missing magnetic transitions 
 //
 // Lines show the connections:
 //   solid green    = confirmed unambiguous match (NT_STRONG)
 //   dashed green   = confirmed loop=1 match (NT_OTHER)
 //   thin gray      = hash-match, not confirmed
 //
-// For blocks that look like ZX Spectrum headers (small block, header flag set),
-// the sector number (data[1]) is printed inside the block.
+// For small blocks that look like sector headers, the sector number (data[1])
+// is printed above the block.
+//
 void DrawPhase2Layout(const vector<Block>& blockList, int offset, int traceFreq, const char* jpgPath, bool verbose)
 {
     if (blockList.empty() || offset <= 0)
@@ -475,6 +518,8 @@ void DrawPhase2Layout(const vector<Block>& blockList, int offset, int traceFreq,
     const int solidLen = numRevs > 1 ? numRevs - 1 : numRevs;
 
     Gdiplus::Font sectorFont(L"Consolas", 12, FontStyleBold, UnitPixel);
+    Gdiplus::Font gapFont(L"Consolas", 12, FontStyleBold, UnitPixel);
+    SolidBrush redTextBrush(Color(255, 220, 0, 0));
     int drawnSectorLabels = 0;
 
     for (size_t i = 0; i < blockList.size(); i++)
@@ -498,16 +543,27 @@ void DrawPhase2Layout(const vector<Block>& blockList, int offset, int traceFreq,
         g.FillRectangle(pFill, rectX, rectY, rectW, rowHeight);
         g.DrawRectangle(&blackPen, rectX, rectY, rectW, rowHeight);
 
+        // Per-track dropout marker: red "1" in upper half if track1 has a
+        // >2×period gap in its raw flux, red "2" in lower half for track2.
+        // Set at decode time in DecodeBlocks; visible even when the block
+        // is otherwise good so we can spot borderline chunks.
+        if (b.track1HasGap)
+            g.DrawString(L"1", -1, &gapFont, PointF((REAL)(rectX + 6), (REAL)(rectY + 5)), &redTextBrush);
+        if (b.track2HasGap)
+            g.DrawString(L"2", -1, &gapFont, PointF((REAL)(rectX + 6), (REAL)(rectY + rowHeight / 2 + 5)), &redTextBrush);
+
         // Label the block with its sector number iff it looks structurally
         // like a real sector header:
+        //   QDOS   - 16 bytes starting with 0xFF, sector number at byte 1
         //   OPD    - 14 bytes starting with 0xFF, sector number at byte 1
         //   ZX Spectrum - 15 bytes with byte 0's flag bit set, sector number at byte 1
         // The size floor also excludes OPD's 4-byte "block header" (which
         // holds fileNum/blockNum, not the sector number) so its byte 1 doesn't
         // draw an overlapping bogus label next to the real sector-header one.
-        bool isOpdSectorHeader = b.data.size() == 14 && b.data[0] == 0xFF;
-        bool isZxSectorHeader  = b.data.size() == 15 && (b.data[0] & 1) == 1;
-        if (isOpdSectorHeader || isZxSectorHeader)
+        bool isQdosSectorHeader = b.data.size() == 16 && b.data[0] == 0xFF;
+        bool isOpdSectorHeader  = b.data.size() == 14 && b.data[0] == 0xFF;
+        bool isZxSectorHeader   = b.data.size() == 15 && (b.data[0] & 1) == 1;
+        if (isQdosSectorHeader || isOpdSectorHeader || isZxSectorHeader)
         {
             WCHAR num[8];
             swprintf_s(num, L"%d", b.data[1]);

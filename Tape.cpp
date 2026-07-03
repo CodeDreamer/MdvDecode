@@ -124,7 +124,7 @@ void Tape::SaveToFile(const char* fileName, int mdvFreq, int detectedOS)
 	header.headerSize = sizeof(Header);
 	header.creatorId = CREATOR_MDVDECODE;
 	header.creatorMajorVersion = 1;
-	header.creatorMinorVersion = 0;
+	header.creatorMinorVersion = 1;
 	header.creatorRevision = 0;
 	header.ulaFamily = (detectedOS == OS_SPECTRUM) ? ULA_INTERFACE_1 : ULA_QL;
 	header.recognizedFileSystem = detectedOS;

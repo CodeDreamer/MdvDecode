@@ -15,9 +15,12 @@ bool Track::StartPhaseLock(float maxDeviation, int minNumBytes)
     if (track.size() < numBits)
         return false;
 
-#ifdef _DEBUG
     vector<int> currentAlignment;
     vector<int> bestAlignment;
+#ifdef _DEBUG
+    const bool wantDebug = true;
+#else
+    const bool wantDebug = debug;
 #endif
 
     __int64 bestError = INT64_MAX;
@@ -30,10 +33,11 @@ bool Track::StartPhaseLock(float maxDeviation, int minNumBytes)
         if (visitedStart[k])
             continue;
 
-#ifdef _DEBUG
-        currentAlignment.clear();
-        currentAlignment.push_back(0);
-#endif
+        if (wantDebug)
+        {
+            currentAlignment.clear();
+            currentAlignment.push_back(0);
+        }
 
         size_t startIndex = offset;
         int time = offsetTime;
@@ -65,11 +69,12 @@ bool Track::StartPhaseLock(float maxDeviation, int minNumBytes)
                     visitedStart[i] = true;
                 __int64 err = duration - period;
                 totError += err * err;
-#ifdef _DEBUG
-                currentAlignment.push_back(lastTime);
-                if (currentAlignment.size() > bestAlignment.size())
-                    bestAlignment = currentAlignment;
-#endif
+                if (wantDebug)
+                {
+                    currentAlignment.push_back(lastTime);
+                    if (currentAlignment.size() > bestAlignment.size())
+                        bestAlignment = currentAlignment;
+                }
                 if (n >= numBits)
                 {
                     if (totError < bestError)
@@ -90,16 +95,25 @@ bool Track::StartPhaseLock(float maxDeviation, int minNumBytes)
                 n = 0;
                 startTime += track[startIndex++];
                 lastTime = startTime;
-#ifdef _DEBUG
-                currentAlignment.clear();
-                totError = 0;
-#endif
+                if (wantDebug)
+                {
+                    currentAlignment.clear();
+                    totError = 0;
+                }
             }
         }
     }
 
     if (bestError != INT64_MAX)
+    {
+        if (debug)
+        {
+            char path[256];
+            snprintf(path, sizeof(path), "flux_%s_phaselock.jpg", debugTag);
+            DrawErrorNamed(track, bestAlignment, path);
+        }
         return true;
+    }
 #if 0
     if (bestAlignment.size() < 100)
         return false;
@@ -112,8 +126,16 @@ bool Track::StartPhaseLock(float maxDeviation, int minNumBytes)
     for (int k = -4; k < 100; k++)
         bestAlignment.push_back((int)(((k + 0.5) * duration) + leftAnchor + 0.5));
 #endif
+    if (debug)
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "flux_%s_phaselock.jpg", debugTag);
+        DrawErrorNamed(track, bestAlignment, path);
+    }
 #ifdef _DEBUG
-    DrawError(track, bestAlignment);
+    // Kept for compatibility with existing Debug workflows
+    if (!debug)
+        DrawError(track, bestAlignment);
 #endif
 
     return false;
@@ -141,9 +163,12 @@ bool Track::FindPreamble(int numZeros, int numOnes, int maxSearchLen, vector<BYT
     preamble.clear();
     float timeOrigin = currentTime;
 
-#ifdef _DEBUG
     vector<int> currentAlignment;
     vector<int> bestAlignment;
+#ifdef _DEBUG
+    const bool wantDebug = true;
+#else
+    const bool wantDebug = debug;
 #endif
 
     BYTE b = 0;
@@ -161,9 +186,8 @@ bool Track::FindPreamble(int numZeros, int numOnes, int maxSearchLen, vector<BYT
                 b = 0;
             }
 
-#ifdef _DEBUG
-            currentAlignment.push_back((int)(expectedTime + 0.5));
-#endif
+            if (wantDebug)
+                currentAlignment.push_back((int)(expectedTime + 0.5));
             if (numBitsRead < 8)
                 bitStartTime[numBitsRead] = (int)(currentTime - timeOrigin + 0.5f);
 
@@ -210,18 +234,26 @@ bool Track::FindPreamble(int numZeros, int numOnes, int maxSearchLen, vector<BYT
         }
         n = 1;
 
-#ifdef _DEBUG
-        if (!found && numBitsRead < maxSearchLen)
+        if (wantDebug && !found && numBitsRead < maxSearchLen)
         {
             if (currentAlignment.size() > bestAlignment.size())
                 bestAlignment = currentAlignment;
             currentAlignment.clear();
         }
-#endif
     }
 
+    if (debug)
+    {
+        // Prefer the actual successful alignment when the preamble was found;
+        // otherwise show the longest partial run so the failure is visible.
+        const vector<int>& toDraw = (found && !currentAlignment.empty()) ? currentAlignment : bestAlignment;
+        char path[256];
+        snprintf(path, sizeof(path), "flux_%s_preamble_%s.jpg",
+            debugTag, found ? "ok" : "fail");
+        DrawErrorNamed(track, toDraw, path);
+    }
 #ifdef _DEBUG
-    if (!found)
+    if (!debug && !found)
         DrawError(track, bestAlignment);
 #endif
     //preamble.clear();

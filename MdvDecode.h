@@ -98,6 +98,12 @@ struct Block
     int mergeQuality;
     int sectorMapType;
     int dbgId;
+    // Set at decode time when the chunk's raw flux contains at least one
+    // interval longer than ~2 bit-periods on that track — likely a dropout
+    // that will manifest as missing / shifted bits. Rendered on the phase2
+    // JPG as a red "1" / "2" inside the block rectangle.
+    bool track1HasGap;
+    bool track2HasGap;
 #ifdef _DEBUG
     float speed;
 #endif
@@ -170,6 +176,12 @@ uint32_t GetLong(const BYTE* p);
 std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& blockList, const Params& params, int *pFirstBlock);
 
 void DrawError(const vector<int>& fluxData, const vector<int>& alignment);
+// Same as DrawError but writes to a specific filename (release-safe;
+// used by Track::StartPhaseLock / FindPreamble when the debug flag is set).
+void DrawErrorNamed(const vector<int>& fluxData, const vector<int>& alignment, const char* path);
+// Variant that also overlays the decoded bit value (0 or 1) inside each cell.
+void DrawErrorNamedBits(const vector<int>& fluxData, const vector<int>& alignment,
+    const vector<int>& bitValues, const char* path);
 void DrawAllBlocks(const vector<Block>& blocks, FileSystem* pFileSys, int firstBlock, const char* jpgPath, bool verbose);
 
 // Diagnostic: visualize block layout and connection state after phase 2 of

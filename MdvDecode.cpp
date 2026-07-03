@@ -42,22 +42,136 @@ inline bool Load(const string& path, vector<BYTE>& result)
     return result.size() != 0;
 }
 
-void ByteSync(Track& track1, Track& track2)
+// Per-chunk instrumentation: how often does ByteSync see the two tracks drift
+// far enough apart that it silently declines to resync (delta >= 40% of the
+// bit period)? Set BYTE_SYNC_TOLERANCE, reset once per DecodeBlock, printed
+// in verbose mode after each block.
+static const float BYTE_SYNC_TOLERANCE = 0.4f;
+
+struct ByteSyncStats
+{
+    int missCount = 0;
+    float maxRatio = 0.0f;    // max observed |delta|/period among misses
+    int firstMissByteIdx = -1;
+    int lastMissByteIdx = -1;
+};
+static ByteSyncStats g_bsStats;
+
+// Byte-window flux picture params (mid-block region-of-interest dump). Set
+// once from main() before the decode loop. When both are non-negative and
+// this chunk's debugTag is active, DecodeBlock saves a flux+alignment JPG
+// per track around block-data byte offset g_fluxByteOffset.
+static int g_fluxByteOffset = -1;
+static int g_fluxByteWindow = 16;
+
+// If chunkIdx is the -flux-jpg target, format a debug tag into `buf` and
+// return it; otherwise return nullptr. Keeps the per-chunk decode loop
+// visually uncluttered by the debug wiring.
+static const char* MakeFluxJpgTag(int chunkIdx, int fluxJpgChunk, int time,
+    int traceFreq, char* buf, size_t bufLen)
+{
+    if (chunkIdx != fluxJpgChunk) return nullptr;
+    snprintf(buf, bufLen, "chunk%d", chunkIdx);
+    printf("Dumping flux picture for chunk #%d (timestamp %lld uSec)\n",
+        chunkIdx, (long long)Timestamp(time, traceFreq));
+    return buf;
+}
+
+// Slice the per-track alignmentBuffer around `byteOffset` (block-level, 0-based)
+// with `halfWidth` bytes of context on each side, and hand it to DrawErrorNamed
+// together with the track's full flux. DrawErrorImpl auto-clips the picture to
+// the flux region matching alignment[0], so windowing the alignment is enough.
+static void SaveByteFluxPictures(Track& track1, Track& track2, const char* debugTag,
+    int byteOffset, int halfWidth)
+{
+    // block.data is interleaved (t1, t2, t1, t2, ...); byte P → track P%2, index P/2
+    int perTrackByte = byteOffset / 2;
+    int firstByte = perTrackByte - halfWidth;
+    if (firstByte < 0) firstByte = 0;
+    int lastByte = perTrackByte + halfWidth + 1;
+    int firstBit = firstByte * 8;
+    int lastBit = lastByte * 8;
+
+    auto dumpOne = [&](Track& t, int trackNum) {
+        const vector<int>& a = t.GetAlignmentBuffer();
+        const vector<int>& v = t.GetBitValueBuffer();
+        if (a.empty()) return;
+        int lo = min(firstBit, (int)a.size());
+        int hi = min(lastBit,  (int)a.size());
+        if (hi - lo < 8) return;   // fewer than one byte of ticks → not useful
+        vector<int> subA(a.begin() + lo, a.begin() + hi);
+        vector<int> subV;
+        if ((int)v.size() >= hi)
+            subV.assign(v.begin() + lo, v.begin() + hi);
+        char path[256];
+        snprintf(path, sizeof(path), "flux_%s_byte%d_track%d.jpg",
+            debugTag, byteOffset, trackNum);
+        DrawErrorNamedBits(t.GetFlux(), subA, subV, path);
+        printf("Saved %s (alignment %d bits, ticks %d..%d)\n", path, hi - lo, lo, hi);
+
+        // Text dump for cross-checking: labeled bits + tick times + raw flux
+        // intervals overlapping the window's time range. Lets us compare what
+        // the decoder concluded vs what the flux numerically contains.
+        printf("  track%d labels (bit lo..hi, LSB-first): ", trackNum);
+        for (size_t i = 0; i < subV.size(); i++)
+            printf("%d%s", subV[i], ((i + 1) % 8 == 0) ? " " : "");
+        printf("\n");
+        printf("  track%d ticks (sample times):", trackNum);
+        for (size_t i = 0; i < subA.size(); i++)
+        {
+            if (i < 8 || i >= subA.size() - 8)
+                printf(" %d", subA[i]);
+            else if (i == 8)
+                printf(" ...");
+        }
+        printf("\n");
+        int tStart = subA.front();
+        int tEnd   = subA.back();
+        const vector<int>& flux = t.GetFlux();
+        printf("  track%d flux intervals in [%d..%d]:", trackNum, tStart, tEnd);
+        int cum = 0;
+        int printed = 0;
+        for (size_t i = 0; i < flux.size() && cum <= tEnd; i++)
+        {
+            cum += flux[i];
+            if (cum >= tStart && cum <= tEnd)
+            {
+                printf(" %d", flux[i]);
+                if (++printed >= 80) { printf(" ..."); break; }
+            }
+        }
+        printf("\n");
+    };
+    dumpOne(track1, 1);
+    dumpOne(track2, 2);
+}
+
+// Returns true if ByteSync applied the correction; false if delta was too big
+// (miss, tracked in g_bsStats) or if we had no midTime yet.
+bool ByteSync(Track& track1, Track& track2)
 {
     float period = (track1.GetPeriod() + track2.GetPeriod()) * 0.5;
     float midTime = track2.GetMidTime();
-    if (midTime != 0)
+    if (midTime == 0)
+        return false;
+
+    double delta = track1.GetExpectedTime() - midTime;
+    double absDelta = fabs(delta);
+    if (absDelta < period * BYTE_SYNC_TOLERANCE)
     {
-        double delta = track1.GetExpectedTime() - midTime;
-        if (abs(delta) < period * 0.4)
-        {
-            track1.SetPeriod(period);
-            track2.SetPeriod(period);
-            delta *= 0.5;
-            track1.AdjustExpectedTime(-delta);
-            track2.AdjustExpectedTime(+delta);
-        }
+        track1.SetPeriod(period);
+        track2.SetPeriod(period);
+        delta *= 0.5;
+        track1.AdjustExpectedTime(-(float)delta);
+        track2.AdjustExpectedTime(+(float)delta);
+        return true;
     }
+
+    g_bsStats.missCount++;
+    float ratio = (float)(absDelta / period);
+    if (ratio > g_bsStats.maxRatio)
+        g_bsStats.maxRatio = ratio;
+    return false;
 }
 
 void ReadBlockData(vector<BYTE>& data, Track& track1, Track& track2, int maxNum)
@@ -73,7 +187,15 @@ void ReadBlockData(vector<BYTE>& data, Track& track1, Track& track2, int maxNum)
             break;
         data.push_back(b2);
 
+        int missBefore = g_bsStats.missCount;
         ByteSync(track1, track2);
+        if (g_bsStats.missCount > missBefore)
+        {
+            int idx = (int)data.size();
+            if (g_bsStats.firstMissByteIdx < 0)
+                g_bsStats.firstMissByteIdx = idx;
+            g_bsStats.lastMissByteIdx = idx;
+        }
     }
 }
 
@@ -98,19 +220,68 @@ bool SyncTracks(Track& track1, Track& track2)
     return true;
 }
 
-bool DecodeBlock(Block& block, Track& track1, Track& track2, float maxDeviation, int minNumBytes, int maxBlockSize, const Params& params)
+enum FailReason
+{
+    FR_NONE = 0,
+    FR_PHASE_LOCK_BOTH,
+    FR_PHASE_LOCK_TRACK1_RESCUED,   // track1 failed, track2 rescued (soft success)
+    FR_PHASE_LOCK_TRACK2_RESCUED,   // track2 failed, track1 rescued (soft success)
+    FR_PREAMBLE_BOTH,
+    FR_PREAMBLE_TRACK2_ONLY,        // recovered with track1's preamble (soft success)
+    FR_NO_DATA,
+    FR_CHUNK_TOO_SHORT,
+    FR__COUNT
+};
+
+static const char* FailReasonName(FailReason r)
+{
+    switch (r)
+    {
+    case FR_NONE:                        return "ok";
+    case FR_PHASE_LOCK_BOTH:             return "phase-lock fail (both tracks)";
+    case FR_PHASE_LOCK_TRACK1_RESCUED:   return "phase-lock track1 rescued via track2";
+    case FR_PHASE_LOCK_TRACK2_RESCUED:   return "phase-lock track2 rescued via track1";
+    case FR_PREAMBLE_BOTH:               return "preamble not found (both tracks)";
+    case FR_PREAMBLE_TRACK2_ONLY:        return "preamble track2 only (recovered)";
+    case FR_NO_DATA:                     return "phase lock ok but no data extracted";
+    case FR_CHUNK_TOO_SHORT:             return "chunk shorter than minBlockLen";
+    default:                             return "unknown";
+    }
+}
+
+bool DecodeBlock(Block& block, Track& track1, Track& track2, float maxDeviation, int minNumBytes, int maxBlockSize, const Params& params, FailReason& reason, const char* debugTag = nullptr)
 {
     block.data.clear();
     block.preamble.clear();
+    reason = FR_NONE;
+    g_bsStats = ByteSyncStats();
 
 #ifdef _DEBUG
     __int64 timestamp = Timestamp(block.startTime, params.traceFreq);
 #endif
 
-    if (!track1.StartPhaseLock(maxDeviation, minNumBytes))
+    // Try both tracks. If either locks, use its period estimate for the
+    // other and let SyncTracks position it. This rescues chunks where one
+    // track has a magnetisation dropout or PLL-warm-up glitch but the other
+    // stays clean (the two tracks share the same physical tape speed, so
+    // the bit period is authoritative from whichever one locked).
+    bool track1Locked = track1.StartPhaseLock(maxDeviation, minNumBytes);
+    bool track2Locked = track2.StartPhaseLock(maxDeviation, minNumBytes);
+    if (!track1Locked && !track2Locked)
+    {
+        reason = FR_PHASE_LOCK_BOTH;
         return false;
-    if (!track2.StartPhaseLock(maxDeviation, minNumBytes))
-        return false;
+    }
+    if (!track1Locked)
+    {
+        track1.Restart(track2.GetPeriod());   // adopt track2's period; SyncTracks below repositions us
+        reason = FR_PHASE_LOCK_TRACK1_RESCUED;
+    }
+    else if (!track2Locked)
+    {
+        track2.Restart(track1.GetPeriod());
+        reason = FR_PHASE_LOCK_TRACK2_RESCUED;
+    }
 
     // Valid data should have signal on both tracks, so ignore anything before
     SyncTracks(track1, track2);
@@ -135,10 +306,28 @@ bool DecodeBlock(Block& block, Track& track1, Track& track2, float maxDeviation,
 
     if (preamble1Ok && !preamble2Ok)
     {
-        printf("Warning: track2 preamble not found, using track1\n");
+        if (params.verbose)
+            printf("Warning: track2 preamble not found, using track1\n");
         track2.Restart(track1.GetPeriod());
         SyncTracks(track1, track2);
         preamble2 = preamble1;
+        reason = FR_PREAMBLE_TRACK2_ONLY;
+    }
+    else if (!preamble1Ok && preamble2Ok)
+    {
+        // Symmetric fallback: track1 had a magnetisation glitch or PLL
+        // warm-up issue; use track2's preamble timing to bootstrap track1.
+        if (params.verbose)
+            printf("Warning: track1 preamble not found, using track2\n");
+        track1.Restart(track2.GetPeriod());
+        SyncTracks(track1, track2);
+        preamble1 = preamble2;
+        preamble1Ok = true;
+        reason = FR_PREAMBLE_TRACK2_ONLY;
+    }
+    else if (!preamble1Ok && !preamble2Ok)
+    {
+        reason = FR_PREAMBLE_BOTH;
     }
 
     float bytePeriod = GetBytePeriod(track1, track2);
@@ -179,9 +368,31 @@ bool DecodeBlock(Block& block, Track& track1, Track& track2, float maxDeviation,
 
     if (preamble1Ok)
     {
+        // Only the "data" pass (unbounded read) is worth a mid-block flux
+        // picture — the header pass is only a handful of bytes.
+        bool wantByteDump = debugTag && g_fluxByteOffset >= 0 && maxBlockSize == 0;
+        if (wantByteDump)
+        {
+            track1.EnableAlignmentCollection(true);
+            track2.EnableAlignmentCollection(true);
+        }
         ReadBlockData(block.data, track1, track2, maxBlockSize ? maxBlockSize : INT_MAX);
+        if (wantByteDump)
+        {
+            SaveByteFluxPictures(track1, track2, debugTag, g_fluxByteOffset, g_fluxByteWindow);
+            track1.EnableAlignmentCollection(false);
+            track2.EnableAlignmentCollection(false);
+        }
         if (params.verbose)
+        {
             printf("Read block with %zu bytes\n", block.data.size());
+            if (g_bsStats.missCount > 0)
+                printf("  ByteSync misses (|delta| >= %.0f%% period): count=%d maxRatio=%.2f byte=[%d..%d] (ts=%lldus)\n",
+                    BYTE_SYNC_TOLERANCE * 100.0f,
+                    g_bsStats.missCount, g_bsStats.maxRatio,
+                    g_bsStats.firstMissByteIdx, g_bsStats.lastMissByteIdx,
+                    (long long)Timestamp(block.startTime, params.traceFreq));
+        }
     }
     else
     {
@@ -214,9 +425,9 @@ bool ShouldSwapTracks(const vector<Chunk>& chunkList, float avgPeriod, float max
             SyncTracks(track1, track2);
 
             vector<BYTE> preamble1, preamble2;
-            int preambleStartTime1, preambleStartTime2;
-            bool preamble1Ok = track1.FindPreamble(2, 1, 30, preamble1, &preambleStartTime1);
-            bool preamble2Ok = track2.FindPreamble(2, 1, 30, preamble2, &preambleStartTime2);
+            int preambleStartTime1_, preambleStartTime2_;
+            bool preamble1Ok = track1.FindPreamble(2, 1, 30, preamble1, &preambleStartTime1_);
+            bool preamble2Ok = track2.FindPreamble(2, 1, 30, preamble2, &preambleStartTime2_);
             if (preamble1Ok && preamble2Ok)
             {
                 float bytePeriod = GetBytePeriod(track1, track2);
@@ -240,8 +451,9 @@ void SwapTracks(vector<Chunk>& chunkList)
         swap(chunk.track1, chunk.track2);
 }
 
-bool DecodeBlocks(const Chunk& chunk, vector<Block>& blockList, int time, float* pAvgPeriod, float maxDeviation, int minNumBytes, const Params& params, int *pExtraGap, int minBlockLen)
+bool DecodeBlocks(const Chunk& chunk, vector<Block>& blockList, int time, float* pAvgPeriod, float maxDeviation, int minNumBytes, const Params& params, int *pExtraGap, int minBlockLen, FailReason& reason, const char* debugTag = nullptr)
 {
+    reason = FR_NONE;
     int maxBlockHeaderSize = params.blockHeaderLen;
     Block block;
     block.gapLen = chunk.gapLen + *pExtraGap;
@@ -249,6 +461,14 @@ bool DecodeBlocks(const Chunk& chunk, vector<Block>& blockList, int time, float*
     *pExtraGap = 0;
     Track track1(chunk.track1, *pAvgPeriod);
     Track track2(chunk.track2, *pAvgPeriod);
+    if (debugTag)
+    {
+        char t1[64], t2[64];
+        snprintf(t1, sizeof(t1), "%s_track1", debugTag);
+        snprintf(t2, sizeof(t2), "%s_track2", debugTag);
+        track1.SetDebug(true, t1);
+        track2.SetDebug(true, t2);
+    }
 
     if (chunk.track1.size() >= (minBlockLen + 1) * 8)
     {
@@ -276,10 +496,25 @@ bool DecodeBlocks(const Chunk& chunk, vector<Block>& blockList, int time, float*
     track1.SetPeriod(*pAvgPeriod);
     track2.SetPeriod(*pAvgPeriod);
 
+    // Per-track "has a long gap" diagnostic: at the current rough bit-period,
+    // scan the chunk's raw intervals for anything > 2× period. That's a
+    // dropout candidate (a stretch of tape with no captured transitions
+    // that PLL can't have kept lock through). Stamped on every block pushed
+    // from this chunk; DrawPhase2Layout renders it as a red "1" or "2".
+    {
+        float gapThreshold = *pAvgPeriod * 2.0f;
+        block.track1HasGap = false;
+        for (int iv : chunk.track1)
+            if ((float)iv > gapThreshold) { block.track1HasGap = true; break; }
+        block.track2HasGap = false;
+        for (int iv : chunk.track2)
+            if ((float)iv > gapThreshold) { block.track2HasGap = true; break; }
+    }
+
     if (maxBlockHeaderSize && chunk.dataLen <= (int)(MIN_SECTOR_SIZE * 8 * *pAvgPeriod))    // Only large chunks can contain block headers + sector data
         maxBlockHeaderSize = 0;
-    
-    bool bOk = DecodeBlock(block, track1, track2, maxDeviation, minNumBytes, maxBlockHeaderSize, params);
+
+    bool bOk = DecodeBlock(block, track1, track2, maxDeviation, minNumBytes, maxBlockHeaderSize, params, reason, debugTag);
 
     if (block.data.size())
         blockList.push_back(block);
@@ -287,6 +522,8 @@ bool DecodeBlocks(const Chunk& chunk, vector<Block>& blockList, int time, float*
     {
         *pExtraGap = block.gapLen + chunk.dataLen;
         bOk = false;
+        if (reason == FR_NONE)
+            reason = FR_NO_DATA;
     }
 
     if (bOk && maxBlockHeaderSize)
@@ -296,7 +533,8 @@ bool DecodeBlocks(const Chunk& chunk, vector<Block>& blockList, int time, float*
         block.startTime += track1.GetTime();
         block.gapLen = 0;
 
-        if (!DecodeBlock(block, track1, track2, maxDeviation, minNumBytes, 0, params))
+        FailReason innerReason = FR_NONE;
+        if (!DecodeBlock(block, track1, track2, maxDeviation, minNumBytes, 0, params, innerReason, debugTag))
             return false;
         if (block.data.size())
             blockList.push_back(block);
@@ -493,7 +731,7 @@ void ExportSpeed(const vector<Block>& blockList, const Params& params)
 
 int main(int argc, char* argv[])
 {
-    printf("MdvDecode 1.0 by Daniele Terdina\n");
+    printf("MdvDecode 1.1 by Daniele Terdina\n");
     Params params;
     params.verbose = false;
     params.blockHeaderLen = 0;
@@ -504,6 +742,10 @@ int main(int argc, char* argv[])
     params.track2Mask = 2;
     bool canChooseChannels = true;
     bool saveJpg = false;
+    int fluxJpgChunk = -1;   // -flux-jpg <index>: dump flux picture for that chunk
+    int fluxByteOffset = -1; // -flux-byte <k>: also dump a mid-block flux picture around byte k of the block
+    int fluxByteWindow = 16; // -flux-window <w>: half-window in bytes (per track) around the byte of interest
+    int dumpBlock = -1;      // -dump-block <index>: dump raw copies of the given merged block
     const float maxFreqError = 0.2;
     const float minGapDuration = 0.002;
 
@@ -524,6 +766,26 @@ int main(int argc, char* argv[])
             params.mdvFreq = 80000;
         else if (!_stricmp(p, "v") || !_stricmp(p, "verbose"))
             params.verbose = true;
+        else if (!_stricmp(p, "flux-jpg") && argIndex + 1 < argc)
+        {
+            fluxJpgChunk = atoi(argv[argIndex + 1]);
+            argIndex++;
+        }
+        else if (!_stricmp(p, "dump-block") && argIndex + 1 < argc)
+        {
+            dumpBlock = atoi(argv[argIndex + 1]);
+            argIndex++;
+        }
+        else if (!_stricmp(p, "flux-byte") && argIndex + 1 < argc)
+        {
+            fluxByteOffset = atoi(argv[argIndex + 1]);
+            argIndex++;
+        }
+        else if (!_stricmp(p, "flux-window") && argIndex + 1 < argc)
+        {
+            fluxByteWindow = atoi(argv[argIndex + 1]);
+            argIndex++;
+        }
         else if (!_stricmp(p, "channels") && argIndex + 2 < argc)
         {
             canChooseChannels = false;
@@ -556,7 +818,11 @@ int main(int argc, char* argv[])
                "  -zx           hint that this is a ZX Spectrum cartridge\n"
                "  -channels <track1ch> <track2ch>   specify which logic trace channels contain each track\n"
                "  -freq <frequency>  trace sampling frequency (default: 24 MHz)\n"
-               "  -jpg          save a diagnostic .jpg visualization of the decoded blocks\n");
+               "  -jpg          save a diagnostic .jpg visualization of the decoded blocks\n"
+               "  -flux-jpg <chunk_index>       save flux+alignment picture for phase-lock/preamble of that chunk\n"
+               "  -flux-byte <byte_offset>      also save mid-block flux picture around that byte of the data block\n"
+               "  -flux-window <bytes>          half-window (default 16) of bytes around -flux-byte to show\n"
+               "  -dump-block <merged_idx>      dump raw copies of the given merged block to stdout\n");
         return 1;
     }
 
@@ -641,25 +907,55 @@ int main(int argc, char* argv[])
     //============================================================================================================
     vector<Block> allBlocks;
     int extraGap = 0;
+    int failByReason[FR__COUNT] = { 0 };
+    int nRecoveredTrack2 = 0;
+    // Propagate -flux-byte / -flux-window into DecodeBlock via file-scope statics.
+    g_fluxByteOffset = fluxByteOffset;
+    g_fluxByteWindow = fluxByteWindow > 0 ? fluxByteWindow : 16;
     for (size_t i = start; i < fluxList.size() - 1; i++)    // Ignore first and last chunk as they will usually be truncated
     {
         time += fluxList[i].gapLen;
         //if (fluxList[i].track1.size() > (minBlockLen + 1) * 8 &&
         //    fluxList[i].track2.size() > (minBlockLen + 1) * 8)
         {
-            if (!DecodeBlocks(fluxList[i], allBlocks, time, &avgPeriod, maxFreqError, minBlockLen, params, &extraGap, minBlockLen))
+            FailReason reason = FR_NONE;
+            char dbgTag[32];
+            const char* debugTagArg = MakeFluxJpgTag((int)i, fluxJpgChunk, time, params.traceFreq, dbgTag, sizeof(dbgTag));
+            bool decoded = DecodeBlocks(fluxList[i], allBlocks, time, &avgPeriod, maxFreqError, minBlockLen, params, &extraGap, minBlockLen, reason, debugTagArg);
+            if (!decoded)
             {
-                if (fluxList[i].track1.size() > (minBlockLen + 1) * 8 &&
-                    fluxList[i].track2.size() > (minBlockLen + 1) * 8)
+                bool longEnough = fluxList[i].track1.size() > (minBlockLen + 1) * 8 &&
+                                  fluxList[i].track2.size() > (minBlockLen + 1) * 8;
+                if (longEnough)
                 {
                     if (params.verbose)
-                        printf("Error decoding data chunk #%zu, timestamp %zu uSec\n", i, Timestamp(time, params.traceFreq));
+                        printf("Error decoding data chunk #%zu, timestamp %zu uSec (%s)\n",
+                            i, Timestamp(time, params.traceFreq), FailReasonName(reason));
                     numFailures++;
+                    if (reason >= 0 && reason < FR__COUNT)
+                        failByReason[reason]++;
                 }
+                else
+                {
+                    failByReason[FR_CHUNK_TOO_SHORT]++;
+                }
+            }
+            else if (reason == FR_PREAMBLE_TRACK2_ONLY)
+            {
+                nRecoveredTrack2++;
             }
         }
 
         time += fluxList[i].dataLen;
+    }
+    if (params.verbose)
+    {
+        printf("Failure breakdown:\n");
+        for (int r = 1; r < FR__COUNT; r++)
+            if (failByReason[r])
+                printf("  %-40s %d\n", FailReasonName((FailReason)r), failByReason[r]);
+        if (nRecoveredTrack2)
+            printf("  (recovered %d chunks via track1 preamble fallback)\n", nRecoveredTrack2);
     }
 
     // Optionally drop blocks without a proper preamble before merging.
@@ -742,6 +1038,33 @@ int main(int argc, char* argv[])
         b.isGood = m.isGood;
         b.sectorMapType = m.sectorMapType;
         b.order = (b.masterId + masterBlocks.size() - firstBlock) % masterBlocks.size();
+    }
+
+    //==========================================================================
+    // Debug output
+    //==========================================================================
+    if (dumpBlock >= 0 && dumpBlock < (int)masterBlocks.size())
+    {
+        const Block& mb = masterBlocks[dumpBlock];
+        printf("=== dump-block %d: merged size=%zu isGood=%d numCopies=%d ===\n",
+            dumpBlock, mb.data.size(), mb.isGood ? 1 : 0, mb.numCopies);
+        // Show merged bytes for reference
+        printf("merged: ");
+        for (size_t k = 0; k < mb.data.size(); k++)
+            printf("%02X%s", mb.data[k], ((k + 1) % 32 == 0) ? "\n        " : " ");
+        printf("\n");
+
+        // Find raw copies (each has masterId == dumpBlock)
+        int revIdx = 0;
+        for (const Block& rb : allBlocks)
+        {
+            if (rb.masterId != dumpBlock) continue;
+            printf("copy %d (rawTs=%lldus, size=%zu): ",
+                revIdx++, (long long)Timestamp(rb.startTime, params.traceFreq), rb.data.size());
+            for (size_t k = 0; k < rb.data.size(); k++)
+                printf("%02X%s", rb.data[k], ((k + 1) % 32 == 0) ? "\n        " : " ");
+            printf("\n");
+        }
     }
 
     if (saveJpg)

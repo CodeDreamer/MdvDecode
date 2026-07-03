@@ -200,15 +200,18 @@ Block MergeSameBlock(vector<Block>& blockList, int blockNum, int masterId, const
     result.data.reserve(len);
     int minBestCount = INT_MAX;
     int firstError = -1;
+    const int majorityThreshold = (int)(copyList.size() / 2 + 1);   // > half
     for (int k = 0; k < len; k++)
     {
         byteCount.clear();
         int bestCount = 0;
         BYTE bestByte = 0;
+        int numContributing = 0;
         for (Block* pBlock : copyList)
         {
             if (k < pBlock->data.size())
             {
+                numContributing++;
                 BYTE b = pBlock->data[k];
                 int count = ++byteCount[b];
                 if (count > bestCount)
@@ -220,9 +223,17 @@ Block MergeSameBlock(vector<Block>& blockList, int blockNum, int masterId, const
         }
 
         result.data.push_back(bestByte);
-        if (bestCount == 1 && minBestCount > 1)
-            firstError = k;
-        minBestCount = min(minBestCount, bestCount);
+        // Only fold this position into the confidence metric if a majority of
+        // the copies actually reach this offset. Tail bytes present in only
+        // one outlier-length block (e.g. a rescued read that produced +1 byte)
+        // otherwise drag minBestCount down to 1 and mark an otherwise-solid
+        // slot unreliable.
+        if (numContributing >= majorityThreshold)
+        {
+            if (bestCount == 1 && minBestCount > 1)
+                firstError = k;
+            minBestCount = min(minBestCount, bestCount);
+        }
     }
 
     if (minBestCount <= 1 && params.verbose)

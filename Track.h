@@ -14,8 +14,30 @@ private:
     float midTime;
     int nBits;
     bool validTime;
+    // Runtime debug flag: when true, StartPhaseLock / FindPreamble draw the
+    // flux + detected bit boundaries to a JPG. Off by default; the caller
+    // enables it selectively for a single chunk of interest.
+    bool debug = false;
+    const char* debugTag = "";
+
+    // Bit-alignment collection for post-read flux pictures around a specific
+    // byte offset. When enabled, ReadBit appends expectedTime per bit call so
+    // the caller can slice a window and hand it to DrawErrorNamed. Costs one
+    // boolean branch per ReadBit; off by default.
+    bool collectAlignment = false;
+    vector<int> alignmentBuffer;
+    vector<int> bitValueBuffer;   // 0/1 read per cell, paired with alignmentBuffer
 
 public:
+    void SetDebug(bool d, const char* tag = "") { debug = d; debugTag = tag; }
+    void EnableAlignmentCollection(bool b)
+    {
+        collectAlignment = b;
+        if (b) { alignmentBuffer.clear(); bitValueBuffer.clear(); }
+    }
+    const vector<int>& GetAlignmentBuffer() const { return alignmentBuffer; }
+    const vector<int>& GetBitValueBuffer() const { return bitValueBuffer; }
+    const vector<int>& GetFlux() const { return track; }
     Track(const vector<int>& t, float startPeriod)
         : track(t)
     {
@@ -101,6 +123,8 @@ public:
 
     int ReadBit()
     {
+        if (collectAlignment)
+            alignmentBuffer.push_back((int)(expectedTime + 0.5f));
         int n;
         if (++nBits <= 5)
         {
@@ -124,7 +148,10 @@ public:
             }
         }
 
-        return (n >= 2) ? 1 : 0;
+        int bit = (n >= 2) ? 1 : 0;
+        if (collectAlignment)
+            bitValueBuffer.push_back(bit);
+        return bit;
     }
 
     bool ReadByte(BYTE& b)

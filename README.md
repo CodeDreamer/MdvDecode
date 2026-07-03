@@ -170,6 +170,37 @@ The `.MDVRAW` file format is documented in [MDVRAW_FORMAT.md](MDVRAW_FORMAT.md).
   logic traces collected on a QL. It may or may not work with traces collected
   on the Spectrum, depending on how close the motor speed is.
 
+### Debugging bad sectors
+
+When a sector fails to decode, or you want to understand why one revolution
+disagrees with the others, these options drill into a single chunk:
+
+| Flag | Effect |
+|---|---|
+| `-flux-jpg <chunk_index>` | Save flux+alignment JPGs for that chunk's phase-lock and preamble regions |
+| `-flux-byte <block_byte>` | Also save a mid-block flux JPG per track around that byte of the block |
+| `-flux-window <bytes>` | Half-window (per track) around `-flux-byte`, default 16 |
+| `-dump-block <merged_idx>` | Print the merged block's raw copies from every rev to stdout for comparison |
+
+Typical flow:
+
+1. Run with `-verbose -jpg` — the "Failure breakdown" section categorizes failures, and
+   the "bad sector" lines print each bad sector's `blockId` (the merged-block index)
+   and `dataSize`.
+2. `-dump-block <blockId>` dumps every rev's raw bytes for that merged block. Diffing
+   them reveals which bytes disagree and, for a single-rev misread, exactly where.
+3. Locate the failing rev's chunk index (its raw timestamp is shown in the dump), then
+   rerun with `-flux-jpg <chunk> -flux-byte <offset>` to save flux pictures around
+   the byte of interest. Each picture shows the raw flux waveform, the decoder's
+   bit-cell boundaries as grey ticks, and the decoded `0`/`1` value inside each cell.
+
+`-verbose -jpg` also writes a phase-2 diagnostic diagram alongside the main JPG,
+with a red `1` or `2` overlaid on any block whose raw flux contains a gap longer
+than about 2 bit-periods on track 1 or track 2 respectively — a quick way to
+spot chunks that MdvDecode would be unlikely to recover no matter what since
+the raw data is missing. For more explanations about this diagram, see the comment
+in SaveDrawing.cpp.
+
 ## License
 
-GPL v3 or later. See [LICENSE](LICENSE).
+GPL v3. See [LICENSE](LICENSE).
