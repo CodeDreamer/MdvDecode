@@ -142,11 +142,13 @@
     <ClCompile Include="SaveDrawing.cpp" />
     <ClCompile Include="Tape.cpp" />
     <ClCompile Include="Track.cpp" />
+    <ClCompile Include="third_party\miniz\miniz.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="FitDistance.h" />
     <ClInclude Include="MdvDecode.h" />
     <ClInclude Include="Track.h" />
+    <ClInclude Include="third_party\miniz\miniz.h" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="OPD_Format_Notes.txt" />

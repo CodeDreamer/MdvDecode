@@ -54,6 +54,6 @@ No other connections are needed.
    Capture takes under a minute and records at least five revolutions of the
    tape.
    Verify that both channels show signal activity before saving.
-5. Save the `.sr` file. To feed it to MdvDecode: rename it to `.zip`,
-   extract it, and pass the resulting directory (containing files named
-   `logic-1-1`, `logic-1-2`, ...) as input.
+5. Save the `.sr` file. MdvDecode reads it directly — pass the `.sr`
+   path as input. (Passing a directory of already-extracted `logic-1-1`,
+   `logic-1-2`, ... chunks still works too.)

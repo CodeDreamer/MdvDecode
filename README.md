@@ -84,8 +84,11 @@ and build `Release | x64`; the output is `x64/Release/MdvDecode.exe`.
 ## Usage
 
 ```
-MdvDecode [options] <input_directory> [<output_file>]
+MdvDecode [options] <input> [<output_file>]
 ```
+
+`<input>` is either a PulseView `.sr` (or plain `.zip`) capture file or a
+directory containing already-extracted `logic-1-1`, `logic-1-2`, ... chunks.
 
 Options:
 
@@ -95,25 +98,23 @@ Options:
 | `-opd` | ICL OPD cartridge (2 headers per sector) |
 | `-zx` | ZX Spectrum Interface 1 cartridge (80 kHz signal rate) |
 | `-channels <ch1> <ch2>` | Force logic-analyzer channels for track 1 / track 2 |
-| `-freq <Hz>` | Trace sampling frequency (default: 24000000) |
+| `-freq <Hz>` | Override trace sampling frequency (default: read from .sr capture metadata, or 24000000) |
 | `-jpg` | Also save a diagnostic block-layout visualization |
 
-If `<output_file>` is omitted, `<input_directory>.MDVRAW` is written next
-to the input. The `-jpg` output is written next to the `.MDVRAW` with the
-same base name. Using both -jpg and -verbose also generates a second diagnostic
-diagram showing intermediate block-matching results.
+If `<output_file>` is omitted, `<input>.MDVRAW` is written next to the input
+(example: `foo.sr` → `foo.MDVRAW`).
+The `-jpg` output is written next to the `.MDVRAW` with the same base name.
+Using both -jpg and -verbose also generates a second diagnostic diagram showing
+intermediate block-matching results.
 
 
 ### Examples
 
 ```
-MdvDecode captures\my_cartridge output\my_cartridge.MDVRAW
-MdvDecode -verbose -jpg captures\68KOSUtil
-MdvDecode -opd captures\my_opd_cartridge
+MdvDecode captures\my_cartridge.sr  output\my_cartridge.MDVRAW
+MdvDecode -verbose -jpg captures\68KOSUtil.sr
+MdvDecode -opd captures\my_opd_cartridge.sr
 ```
-
-To try it out, rename the provided captures/68KOSUtil.sr to 68KOSUtil.zip and
-expand it into a folder that can be used as MdvDecode input.
 
 Example output:
 ```
@@ -200,6 +201,11 @@ than about 2 bit-periods on track 1 or track 2 respectively — a quick way to
 spot chunks that MdvDecode would be unlikely to recover no matter what since
 the raw data is missing. For more explanations about this diagram, see the comment
 in SaveDrawing.cpp.
+
+## Acknowledgements
+
+Directly unzipping `.sr` capture files is powered by [miniz](https://github.com/richgel999/miniz)
+by Rich Geldreich (MIT license — see `third_party/miniz/LICENSE`).
 
 ## License
 

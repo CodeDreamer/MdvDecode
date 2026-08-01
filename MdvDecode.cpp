@@ -4,22 +4,93 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
 #include <string>
+#include <algorithm>
+#include <utility>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "MdvDecode.h"
 #include "Track.h"
+#include "third_party/miniz/miniz.h"
 
 __int64 Timestamp(int time, int traceFreq)
 {
     return (__int64)time * 1000000 / traceFreq;
 }
 
-// Read file into vector
-inline bool Load(const string& path, vector<BYTE>& result)
+static bool EndsWithIgnoreCase(const string& s, const char* suffix)
 {
-    result.clear();
-    char buffer[512];
+    size_t slen = strlen(suffix);
+    if (s.size() < slen)
+        return false;
+    for (size_t i = 0; i < slen; i++)
+        if (tolower((unsigned char)s[s.size() - slen + i]) != tolower((unsigned char)suffix[i]))
+            return false;
+    return true;
+}
 
+// Parse the sigrok INI-style metadata blob for "samplerate=<num> [k|M|G]Hz".
+// Returns the rate in Hz, or 0 if not found / unparseable.
+static int ParseSigrokSamplerate(const char* text, size_t len)
+{
+    string s(text, len);
+    size_t pos = 0;
+    while (pos < s.size())
+    {
+        size_t eol = s.find('\n', pos);
+        if (eol == string::npos)
+            eol = s.size();
+        string line = s.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        size_t a = line.find_first_not_of(" \t\r");
+        if (a == string::npos)
+            continue;
+        line.erase(0, a);
+        size_t b = line.find_last_not_of(" \t\r");
+        if (b != string::npos)
+            line.erase(b + 1);
+
+        static const char* key = "samplerate=";
+        const size_t klen = 11;
+        if (line.size() <= klen)
+            continue;
+        bool match = true;
+        for (size_t i = 0; i < klen; i++)
+            if (tolower((unsigned char)line[i]) != key[i])
+			{
+				match = false;
+				break;
+			}
+        if (!match)
+            continue;
+
+        const char* v = line.c_str() + klen;
+        while (*v == ' ' || *v == '\t')
+            v++;
+        double num = atof(v);
+        while (*v && (isdigit((unsigned char)*v) || *v == '.' || *v == '+' || *v == '-'
+                      || *v == 'e' || *v == 'E'))
+            v++;
+        while (*v == ' ' || *v == '\t')
+            v++;
+        double mult = 1.0;
+        char u = (char)tolower((unsigned char)*v);
+        if (u == 'k')
+			mult = 1e3;
+        else if (u == 'm')
+			mult = 1e6;
+        else if (u == 'g')
+			mult = 1e9;
+        return (int)(num * mult + 0.5);
+    }
+    return 0;
+}
+
+// Read raw logic-1-N chunks from an unpacked sigrok capture directory.
+static bool LoadFromDir(const string& path, vector<BYTE>& result)
+{
+    char buffer[512];
     int fileIndex = 1;
     while (true)
     {
@@ -38,8 +109,99 @@ inline bool Load(const string& path, vector<BYTE>& result)
         fclose(f);
         fileIndex++;
     }
-
     return result.size() != 0;
+}
+
+// Read raw logic-1-N chunks straight out of a sigrok .sr (zip) archive.
+// If pMetadataFreq is non-null and the archive contains a "metadata" file with
+// a recognizable samplerate, it is stored there.
+static bool LoadFromZip(const string& zipPath, vector<BYTE>& result, int* pMetadataFreq)
+{
+    mz_zip_archive zip;
+    memset(&zip, 0, sizeof(zip));
+    if (!mz_zip_reader_init_file(&zip, zipPath.c_str(), 0))
+    {
+        printf("ERROR: Cannot open zip archive %s\n", zipPath.c_str());
+        return false;
+    }
+
+    mz_uint numFiles = mz_zip_reader_get_num_files(&zip);
+    vector<pair<int, mz_uint>> chunks;   // (numeric suffix, archive index)
+    mz_uint metadataIdx = (mz_uint)-1;
+    for (mz_uint i = 0; i < numFiles; i++)
+    {
+        char name[512];
+        mz_zip_reader_get_filename(&zip, i, name, sizeof(name));
+        if (!_stricmp(name, "metadata"))
+            metadataIdx = i;
+        else if (!strncmp(name, "logic-1-", 8))
+        {
+            int idx = atoi(name + 8);
+            if (idx >= 1)
+                chunks.push_back(make_pair(idx, i));
+        }
+    }
+    if (chunks.empty())
+    {
+        mz_zip_reader_end(&zip);
+        printf("ERROR: No logic-1-* entries in %s\n", zipPath.c_str());
+        return false;
+    }
+
+    if (pMetadataFreq && metadataIdx != (mz_uint)-1)
+    {
+        size_t sz = 0;
+        void* buf = mz_zip_reader_extract_to_heap(&zip, metadataIdx, &sz, 0);
+        if (buf)
+        {
+            *pMetadataFreq = ParseSigrokSamplerate((const char*)buf, sz);
+            mz_free(buf);
+        }
+    }
+
+    sort(chunks.begin(), chunks.end());
+
+    size_t total = 0;
+    for (size_t i = 0; i < chunks.size(); i++)
+    {
+        mz_zip_archive_file_stat st;
+        mz_zip_reader_file_stat(&zip, chunks[i].second, &st);
+        total += (size_t)st.m_uncomp_size;
+    }
+    result.resize(total);
+
+    size_t off = 0;
+    for (size_t i = 0; i < chunks.size(); i++)
+    {
+        mz_zip_archive_file_stat st;
+        mz_zip_reader_file_stat(&zip, chunks[i].second, &st);
+        if (!mz_zip_reader_extract_to_mem(&zip, chunks[i].second,
+                &result[off], (size_t)st.m_uncomp_size, 0))
+        {
+            mz_zip_reader_end(&zip);
+            printf("ERROR: Failed to extract logic-1-%d from %s\n", chunks[i].first, zipPath.c_str());
+            result.clear();
+            return false;
+        }
+        off += (size_t)st.m_uncomp_size;
+    }
+    mz_zip_reader_end(&zip);
+    return true;
+}
+
+// Load a full logic-analyzer capture into a single byte stream. `path` is
+// either a directory containing logic-1-1, logic-1-2, ... (as produced by
+// unzipping a .sr file) or the .sr/.zip archive itself.
+// If pMetadataFreq is non-null and the archive carries a recognizable
+// samplerate, it is written there (0 otherwise).
+inline bool Load(const string& path, vector<BYTE>& result, int* pMetadataFreq = NULL)
+{
+    result.clear();
+    if (pMetadataFreq)
+        *pMetadataFreq = 0;
+    if (EndsWithIgnoreCase(path, ".sr") || EndsWithIgnoreCase(path, ".zip"))
+        return LoadFromZip(path, result, pMetadataFreq);
+    return LoadFromDir(path, result);
 }
 
 // Per-chunk instrumentation: how often does ByteSync see the two tracks drift
@@ -746,6 +908,7 @@ int main(int argc, char* argv[])
     int fluxByteOffset = -1; // -flux-byte <k>: also dump a mid-block flux picture around byte k of the block
     int fluxByteWindow = 16; // -flux-window <w>: half-window in bytes (per track) around the byte of interest
     int dumpBlock = -1;      // -dump-block <index>: dump raw copies of the given merged block
+    bool freqExplicit = false;   // set by -freq; suppresses samplerate autodetection from a .sr's metadata
     const float maxFreqError = 0.2;
     const float minGapDuration = 0.002;
 
@@ -802,6 +965,7 @@ int main(int argc, char* argv[])
             argIndex++;
             argError = freq <= 0;
             params.traceFreq = freq;
+            freqExplicit = true;
         }
         else if (!_stricmp(p, "jpg"))
             saveJpg = true;
@@ -811,13 +975,15 @@ int main(int argc, char* argv[])
     }
     if (argError || argIndex >= argc || argc > argIndex + 2)
     {
-        printf("Usage: MdvDecode [<options>] <input_directory> [<output_file>]\n");
-        printf("  Possible options (can be omitted to use default values):\n"
+        printf("Usage: MdvDecode [<options>] <input> [<output_file>]\n");
+        printf("  <input> can be a PulseView .sr file (or plain .zip) or a directory\n"
+               "  containing extracted logic-1-1, logic-1-2, ... chunks.\n"
+               "  Possible options (can be omitted to use default values):\n"
                "  -verbose      print additional messages for troubleshooting\n"
                "  -opd          needed to succesfully parse ICL OPD cartridges\n"
                "  -zx           hint that this is a ZX Spectrum cartridge\n"
                "  -channels <track1ch> <track2ch>   specify which logic trace channels contain each track\n"
-               "  -freq <frequency>  trace sampling frequency (default: 24 MHz)\n"
+               "  -freq <frequency>  override trace sampling frequency (default: read from .sr metadata, or 24 MHz)\n"
                "  -jpg          save a diagnostic .jpg visualization of the decoded blocks\n"
                "  -flux-jpg <chunk_index>       save flux+alignment picture for phase-lock/preamble of that chunk\n"
                "  -flux-byte <byte_offset>      also save mid-block flux picture around that byte of the data block\n"
@@ -831,7 +997,16 @@ int main(int argc, char* argv[])
     if (argIndex + 1 < argc)
         outputFile = argv[argIndex + 1];
     else
-        outputFile = inputDir + ".MDVRAW";
+    {
+        // For X.sr / X.zip inputs, strip the archive extension so the default
+        // output is X.MDVRAW rather than X.sr.MDVRAW.
+        string base = inputDir;
+        if (EndsWithIgnoreCase(base, ".sr"))
+            base.resize(base.size() - 3);
+        else if (EndsWithIgnoreCase(base, ".zip"))
+            base.resize(base.size() - 4);
+        outputFile = base + ".MDVRAW";
+    }
 #else
     // Debugging
     //#define FILENAME "E:\\dev\\MdvDecode\\tapezx"
@@ -850,12 +1025,17 @@ int main(int argc, char* argv[])
     // Load logic trace
     //==========================================================================
     vector<BYTE> data;
-    if (!Load(inputDir.c_str(), data))
+    int metadataFreq = 0;
+    if (!Load(inputDir, data, &metadataFreq))
     {
-        printf("ERROR: Cannot open input files at %s\n", inputDir.c_str());
+        printf("ERROR: Cannot open input at %s\n", inputDir.c_str());
         return 1;
     }
-    // TODO: read trace frequency from metadata
+    if (metadataFreq > 0 && !freqExplicit)
+    {
+        params.traceFreq = metadataFreq;
+        printf("Sample rate from capture metadata: %d Hz\n", metadataFreq);
+    }
     printf("Read %zu bytes (%.2f seconds)\n", data.size(), (float)data.size() / params.traceFreq);
 
     //==========================================================================
@@ -1034,6 +1214,17 @@ int main(int argc, char* argv[])
     for (Block& b : allBlocks)
     {
         //b.masterId = (b.masterId + masterBlocks.size() - firstBlock) % masterBlocks.size();
+        if (b.masterId < 0)
+        {
+            // Orphaned block that never joined a master group (e.g. leading
+            // garbage chunks skipped by MergeAllBlocks' iFirst walk on very
+            // corrupted traces). Give it safe defaults so downstream rendering
+            // doesn't index masterBlocks[-1] or read uninitialized order.
+            b.isGood = false;
+            b.sectorMapType = SMT_UNKNOWN;
+            b.order = -1;
+            continue;
+        }
         Block& m = masterBlocks[b.masterId];
         b.isGood = m.isGood;
         b.sectorMapType = m.sectorMapType;
