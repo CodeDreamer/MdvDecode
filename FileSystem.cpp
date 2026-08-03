@@ -144,7 +144,8 @@ BlockTypeInfo StudyBlockType(const vector<Block>& blockList, int distance, bool 
 		start = headerSize + preambleLen.Mode();
 	}
 
-	return { sizeHist.Mode(),  start, headerSize, traceDistance[traceDistance.size() / 2], realPreambleLen.Mode() };
+	int medianDistance = traceDistance.empty() ? 0 : traceDistance[traceDistance.size() / 2];
+	return { sizeHist.Mode(),  start, headerSize, medianDistance, realPreambleLen.Mode() };
 }
 
 void FindSectors(FileSystem* pFileSys, vector<Block>& blockList, const vector<BlockTypeInfo>& bti, vector<Sector>& sectorList, vector<int>& sectorMap, const Params& params)

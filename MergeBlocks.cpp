@@ -251,7 +251,57 @@ Block MergeSameBlock(vector<Block>& blockList, int blockNum, int masterId, const
     }
 
     result.numCopies = minBestCount;
-    result.preamble = copyList[0]->preamble;
+
+    // Merge the preambles by majority too, but walking from the last byte
+    // backwards: every preamble ends with the FF FF that marks the start of
+    // the block, while its beginning is just wherever the PLL happened to
+    // finish locking.
+    // The majority length rule only kicks in past the shortest preamble the
+    // hardware can still lock onto: 6 zero bytes then FF FF (interleaved).
+	// The result can only be shorter than 8 bytes when every copy is.
+    const int MIN_PREAMBLE_SIZE = 8;
+    vector<BYTE> reversedPreamble;
+    for (int k = 0; ; k++)
+    {
+        byteCount.clear();
+        int bestCount = 0;
+        BYTE bestByte = 0;
+        int numContributing = 0;
+        for (Block* pBlock : copyList)
+        {
+            if (k < (int)pBlock->preamble.size())
+            {
+                numContributing++;
+                BYTE b = pBlock->preamble[pBlock->preamble.size() - 1 - k];
+                int count = ++byteCount[b];
+                if (count > bestCount)
+                {
+                    bestCount = count;
+                    bestByte = b;
+                }
+            }
+        }
+        if (numContributing == 0 || (k >= MIN_PREAMBLE_SIZE && numContributing < majorityThreshold))
+            break;
+        reversedPreamble.push_back(bestByte);
+    }
+    result.preamble.assign(reversedPreamble.rbegin(), reversedPreamble.rend());
+
+    // Repair the merged preamble (set REPAIR_PREAMBLE to false to disable),
+	// but keep any extra bytes before the preamble.
+    const bool REPAIR_PREAMBLE = true;
+    if (REPAIR_PREAMBLE && result.preamble.size() >= 6)
+    {
+        if (result.preamble.size() < MIN_PREAMBLE_SIZE)
+            result.preamble.insert(result.preamble.begin(),
+                MIN_PREAMBLE_SIZE - result.preamble.size(), 0);
+
+        size_t tail = result.preamble.size() - MIN_PREAMBLE_SIZE;
+        for (size_t i = 0; i < MIN_PREAMBLE_SIZE - 2; i++)
+            result.preamble[tail + i] = 0;
+        result.preamble[result.preamble.size() - 2] = 0xFF;
+        result.preamble[result.preamble.size() - 1] = 0xFF;
+    }
 
     int mergeQuality = (minBestCount == copyList.size()) ? MQ_PERFECT : MQ_BAD; // Do all copies match?
     for (Block* pBlock : copyList)
