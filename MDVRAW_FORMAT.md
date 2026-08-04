@@ -108,3 +108,12 @@ and continue. Unknown values in `ulaFamily`, `recognizedFileSystem`, or
 image gets reformatted in a different format. If an emulator can detect
 the FORMAT command, it could set this field back to unknown, or based on
 the ROM type.
+
+## Accessing MDVRAW images
+
+The MDVRAW format is mainly meant to be accessed by real or emulated QL
+systems where the OS and the ZX8302 handle reading and writing data.
+To make it easier to also create tools that directly access sectors in
+MDVRAW images, a ReadExample folder is provided with a code example that
+reads an image and finds all sectors in it (assuming it was formatted by
+QDOS). The code also converts it to a .MDV image.

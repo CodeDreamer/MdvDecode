@@ -222,6 +222,12 @@ spot chunks that MdvDecode would be unlikely to recover no matter what since
 the raw data is missing. For more explanations about this diagram, see the comment
 in SaveDrawing.cpp.
 
+## ReadExample
+
+Example code is provided showing how to identify the location of sectors in MDVRAW
+images.
+ReadExample.exe can also be used to convert from .MDVRAW to .MDV format.
+
 ## Acknowledgements
 
 Directly unzipping `.sr` capture files is powered by [miniz](https://github.com/richgel999/miniz)
