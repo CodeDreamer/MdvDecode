@@ -71,6 +71,9 @@
     <ClInclude Include="third_party\miniz\miniz.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ImageHeader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <Text Include="OPD_Format_Notes.txt" />
