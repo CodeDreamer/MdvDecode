@@ -175,6 +175,105 @@ void DrawErrorNamedBits(const vector<int>& fluxData, const vector<int>& alignmen
     DrawErrorImpl(fluxData, alignment, &bitValues, wPath);
 }
 
+// Draw a single revolution's flux into a horizontal band of `g`. Unlike
+// DrawErrorImpl the horizontal scale is derived from the window itself rather
+// than being a fixed samples-per-pixel, so lanes recorded at slightly
+// different tape speeds still line up cell for cell.
+static void DrawFluxLane(Graphics& g, const FluxWindow& w,
+    int x0, int y0, int laneW, int laneH, const WCHAR* label)
+{
+    if (w.alignment.size() < 2)
+        return;
+
+    const int tStart = w.alignment.front();
+    const int tEnd = w.alignment.back();
+    if (tEnd <= tStart)
+        return;
+    const double scale = (double)laneW / (tEnd - tStart);
+    auto X = [&](int t) { return x0 + (int)((t - tStart) * scale); };
+
+    Pen blackPen(Color(255, 0, 0, 0), 3);
+    Pen lightGreyPen(Color(255, 200, 200, 200), 3);
+    SolidBrush bitBrush(Color(255, 0, 96, 200));
+    SolidBrush labelBrush(Color(255, 90, 90, 90));
+    Gdiplus::Font font(L"Consolas", 14, FontStyleBold, UnitPixel);
+
+    for (int t : w.alignment)
+        g.DrawLine(&lightGreyPen, X(t), y0, X(t), y0 + laneH);
+
+    size_t nCells = min(w.alignment.size() - 1, w.bitValues.size());
+    for (size_t i = 0; i < nCells; i++)
+    {
+        int mid = (X(w.alignment[i]) + X(w.alignment[i + 1])) / 2;
+        g.DrawString(w.bitValues[i] ? L"1" : L"0", -1, &font,
+            PointF((REAL)(mid - 4), (REAL)(y0 + 2)), &bitBrush);
+    }
+
+    if (label)
+        g.DrawString(label, -1, &font, PointF(6.0f, (REAL)(y0 + laneH / 2 - 20)), &labelBrush);
+
+    const int waveHigh = y0 + laneH / 2 - 4;
+    const int waveLow = y0 + laneH - 12;
+    int time = 0;
+    size_t i = 0;
+    while (i < w.flux.size() && time + w.flux[i] < tStart)
+        time += w.flux[i++];
+
+    bool state = true;
+    int lastX = x0;
+    for (; i < w.flux.size(); i++)
+    {
+        time += w.flux[i];
+        g.DrawLine(&blackPen, lastX, waveLow, lastX, waveHigh);
+        int y = state ? waveHigh : waveLow;
+        int x = X(time);
+        if (x > x0 + laneW)
+        {
+            g.DrawLine(&blackPen, lastX, y, x0 + laneW, y);
+            break;
+        }
+        g.DrawLine(&blackPen, lastX, y, x, y);
+        lastX = x;
+        state = !state;
+    }
+}
+
+// Flux from all revolutions in a single picture
+void DrawStackedFlux(const vector<FluxWindow>& lanes, const char* path)
+{
+    if (lanes.empty())
+        return;
+
+    const int width = 4000;
+    const int laneH = 130;
+    const int labelWidth = 210;
+    const int height = laneH * (int)lanes.size();
+
+    Bitmap bmp(width, height, PixelFormat32bppARGB);
+    Graphics g(&bmp);
+    SolidBrush whiteBrush(Color(255, 255, 255, 255));
+    Pen separatorPen(Color(255, 225, 225, 225), 2);
+    g.FillRectangle(&whiteBrush, 0, 0, width, height);
+
+    for (size_t i = 0; i < lanes.size(); i++)
+    {
+        WCHAR label[64];
+        swprintf(label, 64, L"rev %d  chunk %d\n   read %02X",
+            (int)i, lanes[i].chunkIndex, lanes[i].byteValue & 0xFF);
+        int y0 = (int)i * laneH;
+        DrawFluxLane(g, lanes[i], labelWidth, y0, width - labelWidth - 10, laneH - 6, label);
+        if (i)
+            g.DrawLine(&separatorPen, 0, y0, width, y0);
+    }
+
+    WCHAR wPath[MAX_PATH];
+    size_t converted = 0;
+    mbstowcs_s(&converted, wPath, path, _TRUNCATE);
+    HBITMAP hBitmap;
+    bmp.GetHBITMAP(Color::Black, &hBitmap);
+    SaveJpeg(hBitmap, wPath, 85);
+}
+
 void DrawAllBlocks(const vector<Block>& blocks, FileSystem *pFileSys, int firstBlock, const char* jpgPath, bool verbose)
 {
     const int width = 11000;

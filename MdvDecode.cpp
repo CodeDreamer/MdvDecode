@@ -226,6 +226,16 @@ static ByteSyncStats g_bsStats;
 static int g_fluxByteOffset = -1;
 static int g_fluxByteWindow = 16;
 
+// Index of the chunk currently being decoded, so each Block can record where
+// it came from (Block::chunkIndex) without threading it through DecodeBlocks'
+// already long parameter list.
+static int g_currentChunkIndex = -1;
+
+// When non-null, SaveByteFluxPictures appends its per-track windows here
+// instead of writing one JPG each. -flux-block re-decodes the chunks behind a
+// merged block into these, then draws them stacked.
+static vector<FluxWindow>* g_pFluxCapture[2] = { nullptr, nullptr };
+
 // If chunkIdx is the -flux-jpg target, format a debug tag into `buf` and
 // return it; otherwise return nullptr. Keeps the per-chunk decode loop
 // visually uncluttered by the debug wiring.
@@ -265,6 +275,26 @@ static void SaveByteFluxPictures(Track& track1, Track& track2, const char* debug
         vector<int> subV;
         if ((int)v.size() >= hi)
             subV.assign(v.begin() + lo, v.begin() + hi);
+
+        if (g_pFluxCapture[trackNum - 1])
+        {
+            FluxWindow w;
+            w.flux = t.GetFlux();
+            w.alignment = subA;
+            w.bitValues = subV;
+            w.chunkIndex = g_currentChunkIndex;
+            w.byteValue = 0;
+            // Rebuild the byte this revolution read at byteOffset from its own
+            // decoded cells, so the picture is labeled with what this lane saw
+            // rather than with the merged consensus. Cells are stored LSB-first.
+            int bitBase = perTrackByte * 8 - lo;
+            if (bitBase >= 0 && bitBase + 8 <= (int)subV.size())
+                for (int b = 0; b < 8; b++)
+                    w.byteValue |= (subV[bitBase + b] & 1) << b;
+            g_pFluxCapture[trackNum - 1]->push_back(std::move(w));
+            return;
+        }
+
         char path[256];
         snprintf(path, sizeof(path), "flux_%s_byte%d_track%d.jpg",
             debugTag, byteOffset, trackNum);
@@ -618,6 +648,7 @@ bool DecodeBlocks(const Chunk& chunk, vector<Block>& blockList, int time, float*
     reason = FR_NONE;
     int maxBlockHeaderSize = params.blockHeaderLen;
     Block block;
+    block.chunkIndex = g_currentChunkIndex;
     block.gapLen = chunk.gapLen + *pExtraGap;
     block.startTime = time;
     *pExtraGap = 0;
@@ -908,6 +939,7 @@ int main(int argc, char* argv[])
     int fluxByteOffset = -1; // -flux-byte <k>: also dump a mid-block flux picture around byte k of the block
     int fluxByteWindow = 16; // -flux-window <w>: half-window in bytes (per track) around the byte of interest
     int dumpBlock = -1;      // -dump-block <index>: dump raw copies of the given merged block
+    int fluxBlock = -1;      // -flux-block <merged_idx>: stack every revolution's flux around -flux-byte
     bool freqExplicit = false;   // set by -freq; suppresses samplerate autodetection from a .sr's metadata
     const float maxFreqError = 0.2;
     const float minGapDuration = 0.002;
@@ -937,6 +969,11 @@ int main(int argc, char* argv[])
         else if (!_stricmp(p, "dump-block") && argIndex + 1 < argc)
         {
             dumpBlock = atoi(argv[argIndex + 1]);
+            argIndex++;
+        }
+        else if (!_stricmp(p, "flux-block") && argIndex + 1 < argc)
+        {
+            fluxBlock = atoi(argv[argIndex + 1]);
             argIndex++;
         }
         else if (!_stricmp(p, "flux-byte") && argIndex + 1 < argc)
@@ -988,7 +1025,9 @@ int main(int argc, char* argv[])
                "  -flux-jpg <chunk_index>       save flux+alignment picture for phase-lock/preamble of that chunk\n"
                "  -flux-byte <byte_offset>      also save mid-block flux picture around that byte of the data block\n"
                "  -flux-window <bytes>          half-window (default 16) of bytes around -flux-byte to show\n"
-               "  -dump-block <merged_idx>      dump raw copies of the given merged block to stdout\n");
+               "  -dump-block <merged_idx>      dump raw copies of the given merged block to stdout\n"
+               "  -flux-block <merged_idx>      with -flux-byte, one stacked flux picture per track\n"
+               "                                showing every revolution of that block\n");
         return 1;
     }
 
@@ -1100,6 +1139,7 @@ int main(int argc, char* argv[])
         {
             FailReason reason = FR_NONE;
             char dbgTag[32];
+            g_currentChunkIndex = (int)i;
             const char* debugTagArg = MakeFluxJpgTag((int)i, fluxJpgChunk, time, params.traceFreq, dbgTag, sizeof(dbgTag));
             bool decoded = DecodeBlocks(fluxList[i], allBlocks, time, &avgPeriod, maxFreqError, minBlockLen, params, &extraGap, minBlockLen, reason, debugTagArg);
             if (!decoded)
@@ -1136,6 +1176,20 @@ int main(int argc, char* argv[])
                 printf("  %-40s %d\n", FailReasonName((FailReason)r), failByReason[r]);
         if (nRecoveredTrack2)
             printf("  (recovered %d chunks via track1 preamble fallback)\n", nRecoveredTrack2);
+
+        int nGap1 = 0, nGap2 = 0, nGapBoth = 0;
+        for (const Block& b : allBlocks)
+        {
+            if (b.track1HasGap)
+                nGap1++;
+            if (b.track2HasGap)
+                nGap2++;
+            if (b.track1HasGap && b.track2HasGap)
+                nGapBoth++;
+        }
+        if (nGap1 || nGap2)
+            printf("Flux gaps: track1 in %d blocks, track2 in %d, both in %d (of %zu blocks)\n",
+                nGap1, nGap2, nGapBoth, allBlocks.size());
     }
 
     // Optionally drop blocks without a proper preamble before merging.
@@ -1206,7 +1260,7 @@ int main(int argc, char* argv[])
     // OS specific knowledge (optional)
     //==========================================================================
     int firstBlock;
-    auto pFileSys = CheckFileSystem(detectedOS, masterBlocks, params, &firstBlock);
+    auto pFileSys = CheckFileSystem(detectedOS, masterBlocks, params, &firstBlock, &allBlocks);
 
     if (firstBlock < 0)
         firstBlock = ChooseFirstSector(masterBlocks, time);
@@ -1234,6 +1288,68 @@ int main(int argc, char* argv[])
     //==========================================================================
     // Debug output
     //==========================================================================
+    if (fluxBlock >= 0 && fluxBlock < (int)masterBlocks.size())
+    {
+        if (fluxByteOffset < 0)
+            printf("-flux-block also needs -flux-byte <block_byte>\n");
+        else
+        {
+            // The mapping from a merged block back to its raw chunks is only
+            // known after merging, so re-decode just those few chunks with the
+            // flux capture armed. Work on a copy of the running period so the
+            // real decode state is untouched.
+            vector<int> chunkList;
+            for (const Block& rb : allBlocks)
+                if (rb.masterId == fluxBlock && rb.chunkIndex >= 0)
+                    chunkList.push_back(rb.chunkIndex);
+            sort(chunkList.begin(), chunkList.end());
+            chunkList.erase(unique(chunkList.begin(), chunkList.end()), chunkList.end());
+
+            printf("Stacking flux for block %d byte %d over %zu revolution(s):",
+                fluxBlock, fluxByteOffset, chunkList.size());
+            for (int c : chunkList)
+                printf(" %d", c);
+            printf("\n");
+
+            vector<FluxWindow> lanes[2];
+            g_pFluxCapture[0] = &lanes[0];
+            g_pFluxCapture[1] = &lanes[1];
+            for (int c : chunkList)
+            {
+                if (c >= (int)fluxList.size())
+                    continue;
+                g_currentChunkIndex = c;
+                float period = avgPeriod;
+                int extraGap = 0;
+                vector<Block> scratch;
+                FailReason reason = FR_NONE;
+                char tag[32];
+                // Unique per revolution: DecodeBlock also writes phase-lock and
+                // preamble pictures for any active debugTag, and a shared tag
+                // would have each revolution silently overwrite the last.
+                snprintf(tag, sizeof(tag), "block%d_chunk%d", fluxBlock, c);
+                DecodeBlocks(fluxList[c], scratch, 0, &period, maxFreqError, minBlockLen,
+                    params, &extraGap, minBlockLen, reason, tag);
+            }
+            g_pFluxCapture[0] = nullptr;
+            g_pFluxCapture[1] = nullptr;
+
+            for (int track = 0; track < 2; track++)
+            {
+                if (lanes[track].empty())
+                    continue;
+                char path[256];
+                snprintf(path, sizeof(path), "flux_block%d_byte%d_track%d_revs.jpg",
+                    fluxBlock, fluxByteOffset, track + 1);
+                DrawStackedFlux(lanes[track], path);
+                printf("Saved %s (%zu revolutions):", path, lanes[track].size());
+                for (const FluxWindow& w : lanes[track])
+                    printf(" chunk%d=%02X", w.chunkIndex, w.byteValue & 0xFF);
+                printf("\n");
+            }
+        }
+    }
+
     if (dumpBlock >= 0 && dumpBlock < (int)masterBlocks.size())
     {
         const Block& mb = masterBlocks[dumpBlock];
@@ -1250,8 +1366,8 @@ int main(int argc, char* argv[])
         for (const Block& rb : allBlocks)
         {
             if (rb.masterId != dumpBlock) continue;
-            printf("copy %d (rawTs=%lldus, size=%zu): ",
-                revIdx++, (long long)Timestamp(rb.startTime, params.traceFreq), rb.data.size());
+            printf("copy %d (chunk=%d, rawTs=%lldus, size=%zu): ",
+                revIdx++, rb.chunkIndex, (long long)Timestamp(rb.startTime, params.traceFreq), rb.data.size());
             for (size_t k = 0; k < rb.data.size(); k++)
                 printf("%02X%s", rb.data[k], ((k + 1) % 32 == 0) ? "\n        " : " ");
             printf("\n");

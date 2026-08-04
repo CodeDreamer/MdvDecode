@@ -54,8 +54,12 @@ public:
 
 	void ListSectorTypes(const BYTE* pMap, vector<SECTOR_MAP_TYPE>& type)
 	{
+		numSectors = pMap[0x16];
+		if (numSectors < 100 || numSectors > 236)
+			numSectors = 236;
+
 		pMap += 0x28;
-		for (int s = 0; s < 236; s++)
+		for (int s = 0; s < numSectors; s++)
 		{
 			switch (pMap[s << 1])
 			{
@@ -77,7 +81,7 @@ public:
 				break;
 			}
 		}
-		for (int s = 236; s < 256; s++)
+		for (int s = numSectors; s < 256; s++)
 			type[s] = SMT_NOT_FOUND;
 	}
 
@@ -139,9 +143,12 @@ public:
 	}
 
 private:
+	// Sectors on this cartridge, from byte 0x16 of the map
+	int numSectors = 236;
+
 	int FindFileBlock(const BYTE* pMap, BYTE fileNum, BYTE blockNum)
 	{
-		for (int s = 0; s < 236; s++)
+		for (int s = 0; s < numSectors; s++)
 		{
 			if (pMap[0] == fileNum && pMap[1] == blockNum)
 				return s;

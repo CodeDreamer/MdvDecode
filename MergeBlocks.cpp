@@ -238,13 +238,15 @@ Block MergeSameBlock(vector<Block>& blockList, int blockNum, int masterId, const
 
     if (minBestCount <= 1 && params.verbose)
     {
-        int timestamp = Timestamp(blockList[blockNum].startTime, params.traceFreq);
-        printf("timestamp %zu uSec + %d bytes\n", timestamp, firstError);
+        // Report the merged block index too: it is what -dump-block and
+        // -flux-block take, so this line can be acted on directly.
+        int timestamp = (int)Timestamp(blockList[blockNum].startTime, params.traceFreq);
+        printf("timestamp %d uSec + %d bytes (merged block %d)\n", timestamp, firstError, masterId);
         printf("Possibly bad:");
         i = blockNum;
         do
         {
-            printf(" %d (size=%d)", blockList[i].dbgId, blockList[i].data.size());
+            printf(" %d (chunk=%d size=%zu)", blockList[i].dbgId, blockList[i].chunkIndex, blockList[i].data.size());
             i = blockList[i].nextLoopIndex;
         } while (i >= 0);
         printf("\n");

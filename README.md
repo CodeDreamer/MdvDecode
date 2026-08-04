@@ -182,18 +182,38 @@ disagrees with the others, these options drill into a single chunk:
 | `-flux-byte <block_byte>` | Also save a mid-block flux JPG per track around that byte of the block |
 | `-flux-window <bytes>` | Half-window (per track) around `-flux-byte`, default 16 |
 | `-dump-block <merged_idx>` | Print the merged block's raw copies from every rev to stdout for comparison |
+| `-flux-block <merged_idx>` | With `-flux-byte`, one JPG per track stacking every revolution of that block |
 
 Typical flow:
 
-1. Run with `-verbose -jpg` — the "Failure breakdown" section categorizes failures, and
-   the "bad sector" lines print each bad sector's `blockId` (the merged-block index)
-   and `dataSize`.
-2. `-dump-block <blockId>` dumps every rev's raw bytes for that merged block. Diffing
-   them reveals which bytes disagree and, for a single-rev misread, exactly where.
-3. Locate the failing rev's chunk index (its raw timestamp is shown in the dump), then
-   rerun with `-flux-jpg <chunk> -flux-byte <offset>` to save flux pictures around
-   the byte of interest. Each picture shows the raw flux waveform, the decoder's
-   bit-cell boundaries as grey ticks, and the decoded `0`/`1` value inside each cell.
+1. Run with `-verbose` — each "bad sector" line prints the sector's `blockId` (the
+   merged-block index) and `dataSize`, followed by a summary of how the individual
+   revolutions compared. That summary answers the first question worth asking:
+
+   - *every revolution read this identically* — the bytes on the tape really are
+     what was decoded, so the damage predates the capture and re-reading the
+     cartridge cannot help.
+   - *revolutions disagree* — information was lost on the way in, and a cleaner
+     capture (better head contact, another pass) may well recover the sector.
+
+   The same line reports how many revolutions carried flux gaps and how far the
+   worst one strays from the merged result, which says how localized the damage is.
+2. `-flux-block <blockId> -flux-byte <block_byte>` draws every revolution's flux
+   around that byte, stacked top to bottom in one picture, and prints the byte
+   each revolution read. Lanes are normalized to a common width so the bit cells
+   line up even when the tape speed drifted between revolutions, which makes a
+   dropout in one revolution obvious against the others.
+
+   `<block_byte>` is an offset into the block, so for QDOS add 12 to the offset
+   within the sector payload: 4 bytes of block header plus the 8-byte internal
+   preamble.
+
+Each picture shows the raw flux waveform, the decoder's bit-cell boundaries as
+grey ticks, and the decoded `0`/`1` value inside each cell (LSB first within a
+byte). To drill into one revolution on its own, `-dump-block <blockId>` lists
+every revolution's raw bytes together with its chunk index, and
+`-flux-jpg <chunk> -flux-byte <offset>` renders that single chunk, including its
+phase-lock and preamble regions.
 
 `-verbose -jpg` also writes a phase-2 diagnostic diagram alongside the main JPG,
 with a red `1` or `2` overlaid on any block whose raw flux contains a gap longer

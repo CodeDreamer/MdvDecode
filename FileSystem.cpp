@@ -267,7 +267,51 @@ void FindSectors(FileSystem* pFileSys, vector<Block>& blockList, const vector<Bl
 	}
 }
 
-std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& masterBlocks, const Params& params, int *pFirstBlock)
+// Report how the individual revolutions of a failed sector compare with the
+// merged result. The two useful outcomes are opposites: if every revolution
+// read the same bytes then the tape itself holds bad data and re-capturing it
+// will not help, whereas revolutions that disagree (or that carry flux gaps)
+// mean the capture lost information a cleaner read might recover.
+static void ReportCopyAgreement(int sectorNum, const Sector& s, const vector<Block>& masterBlocks,
+	const vector<Block>& rawBlocks, int dataStart, int sectorSize)
+{
+	if (s.blockId < 0 || s.blockId >= (int)masterBlocks.size())
+		return;
+
+	int numCopies = 0, numIdentical = 0, numWithGap = 0, worstDiff = 0;
+	for (const Block& rb : rawBlocks)
+	{
+		if (rb.masterId != s.blockId)
+			continue;
+		numCopies++;
+		if (rb.track1HasGap || rb.track2HasGap)
+			numWithGap++;
+		if ((int)rb.data.size() < dataStart + sectorSize)
+		{
+			worstDiff = sectorSize;
+			continue;
+		}
+		int diffs = 0;
+		for (int k = 0; k < sectorSize; k++)
+			if (rb.data[dataStart + k] != s.data.pData[k])
+				diffs++;
+		if (diffs == 0)
+			numIdentical++;
+		worstDiff = max(worstDiff, diffs);
+	}
+	if (!numCopies)
+		return;
+
+	printf("    %d revolutions, %d identical to merged, worst differs by %d bytes, %d with flux gaps\n",
+		numCopies, numIdentical, worstDiff, numWithGap);
+	if (numIdentical == numCopies && !numWithGap)
+		printf("    every revolution read this identically: the tape holds bad data, re-capturing will not help\n");
+	else
+		printf("    revolutions disagree: information was lost on read, a cleaner capture may recover it\n");
+}
+
+std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& masterBlocks, const Params& params, int *pFirstBlock,
+	const vector<Block>* pRawBlocks)
 {
 	*pFirstBlock = -1;
 	std::unique_ptr<FileSystem> pFileSys;
@@ -344,10 +388,12 @@ std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& maste
 		{
 			if (sectorMap[i] < 0)
 			{
+				bool unused = (sectorType[i] == SMT_EMPTY);
 				numBadSectors++;
 				sectorType[i] = SMT_NOT_FOUND;
 				if (params.verbose)
-					printf("  bad sector #%d: no sector in map\n", i);
+					printf("  bad sector #%d: no sector in map%s\n", i,
+						unused ? " (unused by any file)" : "");
 			}
 			else
 			{
@@ -356,9 +402,13 @@ std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& maste
 				{
 					numBadSectors++;
 					if (params.verbose)
+					{
 						printf("  bad sector #%d: blockId=%d headerId=%d dataSize=%d %s\n",
 							i, s.blockId, s.headerId, s.data.size,
 							s.data.size < sectorSize ? "(short data)" : "(checksum fail)");
+						if (pRawBlocks && s.data.size >= sectorSize)
+							ReportCopyAgreement(i, s, masterBlocks, *pRawBlocks, blockInfo.back().start, sectorSize);
+					}
 				}
 				else
 					isGoodSector[i] = true;

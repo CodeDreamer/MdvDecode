@@ -81,6 +81,10 @@ enum MERGE_QUALITY
 
 struct Block
 {
+    // Index into the chunk list this block was decoded from, or -1 for a
+    // merged master block. Lets the debug options go from a merged block back
+    // to the raw chunk of each revolution without matching on timestamps.
+    int chunkIndex = -1;
     int gapLen;
     int startTime;
     int nextLoopIndex;
@@ -173,7 +177,11 @@ FileSystem* CreateFileSystem_Spectrum();
 uint16_t GetWord(const BYTE* p);
 uint32_t GetLong(const BYTE* p);
 
-std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& blockList, const Params& params, int *pFirstBlock);
+// pRawBlocks, when supplied, is the unmerged block list. It is only used to
+// report how the individual revolutions of a bad sector agreed with each other,
+// which distinguishes damage in the capture from damage on the tape.
+std::unique_ptr<FileSystem> CheckFileSystem(int detectedOS, vector<Block>& blockList, const Params& params, int *pFirstBlock,
+    const vector<Block>* pRawBlocks = nullptr);
 
 void DrawError(const vector<int>& fluxData, const vector<int>& alignment);
 // Same as DrawError but writes to a specific filename (release-safe;
@@ -183,6 +191,20 @@ void DrawErrorNamed(const vector<int>& fluxData, const vector<int>& alignment, c
 void DrawErrorNamedBits(const vector<int>& fluxData, const vector<int>& alignment,
     const vector<int>& bitValues, const char* path);
 void DrawAllBlocks(const vector<Block>& blocks, FileSystem* pFileSys, int firstBlock, const char* jpgPath, bool verbose);
+
+// One revolution's flux around a byte of interest, captured by -flux-block so
+// every revolution can be drawn in a single stacked picture for comparison.
+struct FluxWindow
+{
+    vector<int> flux;         // whole track, clipped at draw time
+    vector<int> alignment;    // bit-cell boundaries inside the window
+    vector<int> bitValues;    // decoded bit per cell
+    int chunkIndex;
+    int byteValue;            // what this revolution read at the target byte
+};
+// Draw one lane per revolution, stacked top to bottom and normalized to the
+// same width so the bit cells line up across lanes.
+void DrawStackedFlux(const vector<FluxWindow>& lanes, const char* path);
 
 // Diagnostic: visualize block layout and connection state after phase 2 of
 // MergeAllBlocks (hash-match + MakeConnections), before any Overlaps-based
